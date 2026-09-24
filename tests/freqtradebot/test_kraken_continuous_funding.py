@@ -121,6 +121,14 @@ def test_dry_entry_add_reduce_close_and_repeated_poll(
     )
     assert not trade.is_open
     assert trade.realized_profit == pytest.approx(sign * 0.125)
+    exit_fills = [
+        call.args[0]
+        for call in bot.rpc.send_msg.call_args_list
+        if call.args[0]["type"] == RPCMessageType.EXIT_FILL
+    ]
+    assert exit_fills[-1]["profit_amount"] == pytest.approx(sign * 0.025)
+    assert exit_fills[-1]["cumulative_profit"] == pytest.approx(sign * 0.125)
+    assert sum(message["profit_amount"] for message in exit_fills) == pytest.approx(sign * 0.125)
     closing = trade.orders[-1]
     bot.update_trade_state(trade, closing.order_id)
     assert trade.realized_profit == pytest.approx(sign * 0.125)

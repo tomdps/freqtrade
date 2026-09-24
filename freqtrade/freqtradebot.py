@@ -1521,7 +1521,7 @@ class FreqtradeBot(LoggingMixin):
             # We check if stoploss order is fulfilled
             if stoploss_order and stoploss_order["status"] in ("closed", "triggered"):
                 trade.exit_reason = ExitType.STOPLOSS_ON_EXCHANGE.value
-                self._notify_exit(trade, "stoploss", True)
+                self._notify_exit(trade, "stoploss", True, order=slo)
                 self.handle_protections(trade.pair, trade.trade_direction)
                 return True
 
@@ -2249,25 +2249,30 @@ class FreqtradeBot(LoggingMixin):
             else None
         )
 
+        funding_fees = None
+        if (
+            fill
+            and order is not None
+            and self.exchange.get_option("funding_fee_continuous", False) is True
+        ):
+            funding_fees = 0.0
+            for filled_order in trade.select_filled_orders():
+                funding_fees += filled_order.funding_fee or 0.0
+                if filled_order.order_id == order.order_id:
+                    break
+                if filled_order.ft_order_side != trade.entry_side:
+                    funding_fees = 0.0
+
         # second condition is for mypy only; order will always be passed during sub trade
         if sub_trade and order is not None:
             amount = order.safe_filled if fill else order.safe_amount
             order_rate: float = order.safe_price
-            funding_fees = None
-            if fill and self.exchange.get_option("funding_fee_continuous", False) is True:
-                funding_fees = 0.0
-                for filled_order in trade.select_filled_orders():
-                    funding_fees += filled_order.funding_fee or 0.0
-                    if filled_order.order_id == order.order_id:
-                        break
-                    if filled_order.ft_order_side != trade.entry_side:
-                        funding_fees = 0.0
             profit = trade.calculate_profit(
                 order_rate, amount, trade.open_rate, funding_fees=funding_fees
             )
         else:
             order_rate = trade.safe_close_rate
-            profit = trade.calculate_profit(rate=order_rate)
+            profit = trade.calculate_profit(rate=order_rate, funding_fees=funding_fees)
             amount = trade.amount
         gain: ProfitLossStr = "profit" if profit.profit_ratio > 0 else "loss"
 

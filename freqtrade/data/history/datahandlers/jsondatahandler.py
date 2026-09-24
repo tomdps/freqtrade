@@ -47,7 +47,7 @@ class JsonDataHandler(IDataHandler):
 
         # Reset index, select only appropriate columns and save as json.
         # The projection also drops the in-memory-only compatibility aliases.
-        _data.reset_index(drop=True).loc[:, get_candle_columns(candle_type)].to_json(
+        _data.reset_index(drop=True).loc[:, get_candle_columns(candle_type, data.columns)].to_json(
             filename, orient="values", compression="gzip" if self._use_zip else None
         )
 
@@ -80,7 +80,7 @@ class JsonDataHandler(IDataHandler):
         except ValueError:
             logger.error(f"Could not load data for {pair}.")
             return self._empty_ohlcv_df(candle_type)
-        pairdata = pairdata.astype(dtype=get_candle_dtypes(candle_type))
+        pairdata = pairdata.astype(dtype=get_candle_dtypes(candle_type, pairdata.columns))
         pairdata["date"] = to_datetime(pairdata["date"], unit="ms", utc=True).dt.as_unit("ms")
         return pairdata
 

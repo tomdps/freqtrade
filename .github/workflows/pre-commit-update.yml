@@ -15,6 +15,7 @@ concurrency:
 
 jobs:
   auto-update:
+    if: github.repository == 'freqtrade/freqtrade'
     name: Auto-update pre-commit hooks
     runs-on: ubuntu-latest
     environment:

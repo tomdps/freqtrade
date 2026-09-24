@@ -32,6 +32,7 @@ from freqtrade.exceptions import (
     ExchangeError,
     InsufficientFundsError,
     InvalidOrderException,
+    OperationalException,
     PricingError,
 )
 from freqtrade.exchange import (
@@ -277,6 +278,10 @@ class FreqtradeBot(LoggingMixin):
             self.strategy.gather_informative_pairs(),
         )
 
+        if self.exchange.get_option("funding_fee_continuous", False) is True:
+            self.update_funding_fees()
+            self.wallets.update()
+
         strategy_safe_wrapper(self.strategy.bot_loop_start, supress_error=True)(
             current_time=datetime.now(UTC)
         )
@@ -292,6 +297,9 @@ class FreqtradeBot(LoggingMixin):
         # Without this, freqtrade may try to recreate stoploss_on_exchange orders
         # while exiting is in process, since telegram messages arrive in an different thread.
         with self._exit_lock:
+            if self.exchange.get_option("funding_fee_continuous", False) is True:
+                self.update_funding_fees()
+                self.wallets.update()
             trades = Trade.get_open_trades()
             # First process current opened trades (positions)
             self.exit_positions(trades)
@@ -378,6 +386,9 @@ class FreqtradeBot(LoggingMixin):
         if self.trading_mode == TradingMode.FUTURES:
             trades: list[Trade] = Trade.get_open_trades()
             for trade in trades:
+                if self.exchange.get_option("funding_fee_continuous", False) is True:
+                    self._update_continuous_funding(trade, datetime.now(UTC))
+                    continue
                 trade.set_funding_fees(
                     self.exchange.get_funding_fees(
                         pair=trade.pair,
@@ -386,6 +397,21 @@ class FreqtradeBot(LoggingMixin):
                         open_date=trade.date_last_filled_utc,
                     )
                 )
+
+    def _update_continuous_funding(
+        self, trade: Trade, end: datetime, exclude_order: str | None = None
+    ) -> None:
+        """Accrue the unchanged exposure since its last actual fill, before mutation."""
+        orders = [o for o in trade.select_filled_orders() if o.order_id != exclude_order]
+        amount = sum(
+            o.safe_amount_after_fee * (1 if o.ft_order_side == trade.entry_side else -1)
+            for o in orders
+        )
+        start = max((o.order_filled_utc for o in orders), default=end)
+        funding = self.exchange._fetch_and_calculate_funding_fees(
+            trade.pair, max(0.0, amount), trade.is_short, start, end
+        )
+        trade.set_funding_fees(funding)
 
     def startup_backpopulate_precision(self) -> None:
         trades = Trade.get_trades([Trade.contract_size.is_(None)])
@@ -1495,7 +1521,7 @@ class FreqtradeBot(LoggingMixin):
             # We check if stoploss order is fulfilled
             if stoploss_order and stoploss_order["status"] in ("closed", "triggered"):
                 trade.exit_reason = ExitType.STOPLOSS_ON_EXCHANGE.value
-                self._notify_exit(trade, "stoploss", True)
+                self._notify_exit(trade, "stoploss", True, order=slo)
                 self.handle_protections(trade.pair, trade.trade_direction)
                 return True
 
@@ -2223,15 +2249,30 @@ class FreqtradeBot(LoggingMixin):
             else None
         )
 
+        funding_fees = None
+        if (
+            fill
+            and order is not None
+            and self.exchange.get_option("funding_fee_continuous", False) is True
+        ):
+            funding_fees = 0.0
+            for filled_order in trade.select_filled_orders():
+                funding_fees += filled_order.funding_fee or 0.0
+                if filled_order.order_id == order.order_id:
+                    break
+                if filled_order.ft_order_side != trade.entry_side:
+                    funding_fees = 0.0
+
         # second condition is for mypy only; order will always be passed during sub trade
         if sub_trade and order is not None:
             amount = order.safe_filled if fill else order.safe_amount
             order_rate: float = order.safe_price
-
-            profit = trade.calculate_profit(order_rate, amount, trade.open_rate)
+            profit = trade.calculate_profit(
+                order_rate, amount, trade.open_rate, funding_fees=funding_fees
+            )
         else:
             order_rate = trade.safe_close_rate
-            profit = trade.calculate_profit(rate=order_rate)
+            profit = trade.calculate_profit(rate=order_rate, funding_fees=funding_fees)
             amount = trade.amount
         gain: ProfitLossStr = "profit" if profit.profit_ratio > 0 else "loss"
 
@@ -2369,6 +2410,22 @@ class FreqtradeBot(LoggingMixin):
             logger.warning("Unable to fetch order %s: %s", order_id, exception)
             return False
 
+        continuous = self.exchange.get_option("funding_fee_continuous", False) is True
+        if continuous and order.get("filled"):
+            if order["status"] == "open":
+                raise OperationalException(
+                    "Continuous funding requires finalized whole-order fills."
+                )
+            existing = trade.select_order_by_order_id(order_id)
+            if existing is not None and existing.funding_fee is None:
+                filled_at = order.get("lastTradeTimestamp")
+                end = (
+                    dt_from_ts(filled_at)
+                    if filled_at
+                    else (existing.order_filled_utc or datetime.now(UTC))
+                )
+                self._update_continuous_funding(trade, end, exclude_order=order_id)
+
         trade.update_order(order)
 
         if self.exchange.check_order_canceled_empty(order):
@@ -2382,6 +2439,8 @@ class FreqtradeBot(LoggingMixin):
         self.handle_order_fee(trade, order_obj, order)
 
         trade.update_trade(order_obj, not send_msg)
+        if continuous and trade.is_open:
+            self._update_continuous_funding(trade, datetime.now(UTC))
 
         trade = self._update_trade_after_fill(trade, order_obj, send_msg)
         Trade.commit()

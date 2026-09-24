@@ -424,7 +424,9 @@ class Backtesting:
                 pairs=self.pairlists.whitelist,
                 timeframe=funding_fee_timeframe,
                 timerange=self.timerange,
-                startup_candles=0,
+                startup_candles=int(
+                    self.exchange.get_option("funding_fee_continuous", False) is True
+                ),
                 fail_without_data=True,
                 fill_up_missing=False,
                 data_format=self.config["dataformat_ohlcv"],
@@ -807,8 +809,12 @@ class Backtesting:
         :return: True if the order filled.
         """
         if order and self._get_order_filled(order.ft_price, row):
+            continuous = self.exchange.get_option("funding_fee_continuous", False) is True
+            if continuous:
+                self._run_funding_fees(trade, current_date, force=True)
             order.close_bt_order(current_date, trade)
-            self._run_funding_fees(trade, current_date, force=True)
+            if not continuous:
+                self._run_funding_fees(trade, current_date, force=True)
             strategy_safe_wrapper(self.strategy.order_filled, supress_error=True)(
                 pair=trade.pair,
                 trade=trade,  # type: ignore[arg-type]
@@ -1009,7 +1015,11 @@ class Backtesting:
         Calculate funding fees if necessary and add them to the trade.
         """
         if self.trading_mode == TradingMode.FUTURES:
-            if force or (current_time.timestamp() % self.funding_fee_timeframe_secs) == 0:
+            if (
+                force
+                or self.exchange.get_option("funding_fee_continuous", False) is True
+                or (current_time.timestamp() % self.funding_fee_timeframe_secs) == 0
+            ):
                 # Funding fee interval.
                 trade.set_funding_fees(
                     self.exchange.calculate_funding_fees(
@@ -1628,14 +1638,30 @@ class Backtesting:
             i += 1
             current_time += self.timeframe_detail_td
 
-    def _time_pair_generator_det(self, current_time: datetime, pairs: list[str]):
+    def _time_pair_generator_det(
+        self, current_time: datetime, pairs: list[str], end_date: datetime
+    ):
+        detail_end = current_time + self.timeframe_td
+        if self.exchange.get_option("funding_fee_continuous", False) is True:
+            detail_end = min(detail_end, end_date)
         for current_time_det, is_first, has_detail, idx in self._time_generator_det(
-            current_time, current_time + self.timeframe_td
+            current_time, detail_end
         ):
+            if not is_first:
+                self._update_continuous_funding(current_time_det, capture=True)
             # Pairs that have open trades should be processed first
             new_pairlist = list(dict.fromkeys([t.pair for t in LocalTrade.bt_trades_open] + pairs))
             for pair in new_pairlist:
                 yield current_time_det, is_first, has_detail, idx, pair
+
+    def _update_continuous_funding(self, current_time: datetime, capture: bool = False) -> None:
+        """Refresh every open exposure before callbacks or shared-wallet decisions."""
+        if self.exchange.get_option("funding_fee_continuous", False) is True:
+            for trade in LocalTrade.bt_trades_open:
+                self._run_funding_fees(trade, current_time)
+            self.wallets.update()
+            if capture:
+                self._capture_wallet(current_time, self.strategy.config["stake_currency"], 1)
 
     def time_pair_generator(
         self,
@@ -1667,6 +1693,7 @@ class Backtesting:
             # Reset open trade count for this candle
             # Critical to avoid exceeding max_open_trades in backtesting
             # when timeframe-detail is used and trades close within the opening candle.
+            self._update_continuous_funding(current_time)
             strategy_safe_wrapper(self.strategy.bot_loop_start, supress_error=True)(
                 current_time=current_time
             )
@@ -1676,7 +1703,7 @@ class Backtesting:
             self._capture_wallet(current_time, self.strategy.config["stake_currency"], 1)
 
             for current_time_det, is_first, has_detail, idx, pair in self._time_pair_generator_det(
-                current_time, pairs
+                current_time, pairs, end_date
             ):
                 # Loop for each detail candle (if necessary) and pair
                 # Yields only the main date if no detail timeframe is set.

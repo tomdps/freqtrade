@@ -15,6 +15,7 @@ permissions:
 
 jobs:
   auto-update:
+    if: github.repository == 'freqtrade/freqtrade'
     name: "Auto Update Binance Leverage Tiers"
     runs-on: ubuntu-latest
     environment:

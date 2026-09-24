@@ -84,5 +84,6 @@ def test_all_candle_value_columns():
         "close",
         "volume",
         "funding_rate",
+        "funding_rate_absolute",
     }
     assert "date" not in ALL_CANDLE_VALUE_COLUMNS

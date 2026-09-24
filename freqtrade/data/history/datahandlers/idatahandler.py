@@ -146,7 +146,7 @@ class IDataHandler(ABC):
         :return: DataFrame with the canonical columns for this candle type
         :raises ValueError: if the layout cannot be interpreted
         """
-        columns = get_candle_columns(candle_type)
+        columns = get_candle_columns(candle_type, df.columns)
         # Current layout - project and reorder. Checked first so a file that carries both
         # the current columns and stale legacy ones is read as the current layout.
         if set(columns).issubset(df.columns):
@@ -169,7 +169,8 @@ class IDataHandler(ABC):
         :return: DataFrame with the canonical columns for this candle type
         :raises ValueError: if the width matches neither the current nor the legacy layout
         """
-        columns = get_candle_columns(candle_type)
+        absolute = candle_type == CandleType.FUNDING_RATE and df.shape[1] == 3
+        columns = get_candle_columns(candle_type, ["funding_rate_absolute"] if absolute else [])
         if df.shape[1] == len(columns):
             df.columns = columns
             return df

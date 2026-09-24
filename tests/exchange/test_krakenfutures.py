@@ -659,14 +659,15 @@ def test_krakenfutures_get_funding_fees_futures_success(mocker, default_conf):
 
 
 def test_krakenfutures_get_funding_fees_futures_exchange_error(mocker, default_conf):
-    """Return 0.0 when funding fee retrieval fails."""
+    """Do not silently erase funding when the public endpoint fails."""
     conf = dict(default_conf)
     conf["trading_mode"] = TradingMode.FUTURES
     ex = get_patched_exchange(mocker, conf, exchange="krakenfutures")
 
     mocker.patch.object(ex, "_fetch_and_calculate_funding_fees", side_effect=ExchangeError("fail"))
 
-    assert ex.get_funding_fees("BTC/USD:USD", 0.1, False, None) == 0.0
+    with pytest.raises(ExchangeError, match="fail"):
+        ex.get_funding_fees("BTC/USD:USD", 0.1, False, None)
 
 
 def test_krakenfutures_get_funding_fees_spot_returns_zero(mocker, default_conf):

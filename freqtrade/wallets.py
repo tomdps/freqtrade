@@ -104,6 +104,12 @@ class Wallets:
             return pos.position
         return 0
 
+    def _unrealized_funding(self, trades: list) -> float:
+        """Funding since the last exit is available but not yet in realized profit."""
+        if self._exchange.get_option("funding_fee_continuous", False) is not True:
+            return 0.0
+        return sum(trade.funding_fees_since_last_exit for trade in trades)
+
     def _update_dry(self) -> None:
         """
         Update from database in dry-run mode
@@ -122,6 +128,7 @@ class Wallets:
             # Backtest mode
             tot_profit = LocalTrade.bt_total_profit
         tot_profit += sum(trade.realized_profit for trade in open_trades)
+        tot_profit += self._unrealized_funding(open_trades)
         tot_in_trades = sum(trade.stake_amount for trade in open_trades)
         used_stake = 0.0
 

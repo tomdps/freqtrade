@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 from sqlalchemy import select
 
-from freqtrade.enums import CandleType, ExitCheckTuple, ExitType
+from freqtrade.enums import CandleType, ExitCheckTuple, ExitType, RPCMessageType
 from freqtrade.freqtradebot import FreqtradeBot
 from freqtrade.persistence import Order, Trade
 from freqtrade.util import dt_utc
@@ -99,6 +99,13 @@ def test_dry_entry_add_reduce_close_and_repeated_poll(
     assert trade.amount == 10
     assert trade.realized_profit == pytest.approx(sign * 0.1)
     assert trade.funding_fees == pytest.approx(sign * 0.1)
+    partial_fill = [
+        call.args[0]
+        for call in bot.rpc.send_msg.call_args_list
+        if call.args[0]["type"] == RPCMessageType.EXIT_FILL and call.args[0]["sub_trade"]
+    ][-1]
+    assert partial_fill["profit_amount"] == pytest.approx(sign * 0.1)
+    assert partial_fill["profit_ratio"] == pytest.approx(sign * 0.0001)
     time_machine.move_to(START + timedelta(minutes=60), tick=False)
     bot.update_funding_fees()
     bot.wallets.update()
@@ -118,6 +125,46 @@ def test_dry_entry_add_reduce_close_and_repeated_poll(
     bot.update_trade_state(trade, closing.order_id)
     assert trade.realized_profit == pytest.approx(sign * 0.125)
     assert bot.wallets.get_total("USDT") == pytest.approx(10000 + sign * 0.125)
+
+
+@pytest.mark.parametrize("short", [False, True])
+def test_dry_partial_exits_clear_profit_when_funding_offsets(
+    mocker, default_conf_usdt, time_machine, short
+):
+    time_machine.move_to(START, tick=False)
+    bot = make_bot(mocker, default_conf_usdt)
+    frame = pd.DataFrame(
+        {
+            "date": pd.date_range(START, periods=4, freq="h"),
+            "funding_rate": [0.0001, -0.00015, 0, 0],
+            "funding_rate_absolute": [0.01, -0.015, 0, 0],
+        }
+    )
+    bot.exchange.refresh_latest_ohlcv.return_value = {(PAIR, "1h", CandleType.FUNDING_RATE): frame}
+    assert bot.execute_entry(PAIR, 300, ordertype="market", is_short=short)
+    trade = Trade.session.scalars(select(Trade)).one()
+    sign = 1 if short else -1
+    time_machine.move_to(START + timedelta(hours=1), tick=False)
+    assert bot.execute_trade_exit(
+        trade, 100, ExitCheckTuple(ExitType.EXIT_SIGNAL), ordertype="market", sub_trade_amt=1
+    )
+    assert trade.realized_profit == pytest.approx(sign * 0.03)
+    time_machine.move_to(START + timedelta(hours=2), tick=False)
+    assert bot.execute_trade_exit(
+        trade, 100, ExitCheckTuple(ExitType.EXIT_SIGNAL), ordertype="market", sub_trade_amt=1
+    )
+    assert trade.amount == 1
+    assert trade.funding_fees == pytest.approx(0)
+    assert trade.realized_profit == pytest.approx(0)
+    assert trade.calculate_profit(100).total_profit == pytest.approx(0)
+    assert bot.wallets.get_total("USDT") == pytest.approx(10000, abs=1e-9, rel=0)
+    partial_fill = [
+        call.args[0]
+        for call in bot.rpc.send_msg.call_args_list
+        if call.args[0]["type"] == RPCMessageType.EXIT_FILL and call.args[0]["sub_trade"]
+    ][-1]
+    assert partial_fill["profit_amount"] == pytest.approx(-sign * 0.03)
+    assert partial_fill["cumulative_profit"] == pytest.approx(0)
 
 
 def test_dry_delayed_fill_accrues_only_after_fill(mocker, default_conf_usdt, time_machine):

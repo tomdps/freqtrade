@@ -2253,8 +2253,18 @@ class FreqtradeBot(LoggingMixin):
         if sub_trade and order is not None:
             amount = order.safe_filled if fill else order.safe_amount
             order_rate: float = order.safe_price
-
-            profit = trade.calculate_profit(order_rate, amount, trade.open_rate)
+            funding_fees = None
+            if fill and self.exchange.get_option("funding_fee_continuous", False) is True:
+                funding_fees = 0.0
+                for filled_order in trade.select_filled_orders():
+                    funding_fees += filled_order.funding_fee or 0.0
+                    if filled_order.order_id == order.order_id:
+                        break
+                    if filled_order.ft_order_side != trade.entry_side:
+                        funding_fees = 0.0
+            profit = trade.calculate_profit(
+                order_rate, amount, trade.open_rate, funding_fees=funding_fees
+            )
         else:
             order_rate = trade.safe_close_rate
             profit = trade.calculate_profit(rate=order_rate)

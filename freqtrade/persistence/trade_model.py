@@ -1344,7 +1344,7 @@ class LocalTrade:
         self.funding_fees = total_funding_fees
         self.max_stake_amount = float(max_stake_amount) / (self.leverage or 1.0)
 
-        if close_profit:
+        if close_profit or (self.exchange == "krakenfutures" and self.nr_of_successful_exits):
             self.close_profit = close_profit
             self.realized_profit = close_profit_abs
             self.close_profit_abs = prof.profit_abs

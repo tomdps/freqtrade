@@ -1,7 +1,7 @@
 # Kraken continuous funding
 
 This fork starts from Freqtrade 2026.8. The local package version
-`2026.8+kraken.1` identifies its Kraken funding correction. The patch targets
+`2026.8+kraken.2` identifies its Kraken funding correction. The patch targets
 backtesting and dry-run accounting; it has not been reconciled against a live
 account ledger.
 
@@ -28,6 +28,10 @@ use profit or available balance. Tests cover elapsed-time boundaries, signs,
 rate changes, position adjustments, repeated order updates and open-position
 funding. The dry-run fill model does not establish real exchange queue priority
 or intraminute partial-fill fidelity.
+
+Backtests recompute each open trade's funding at every candle. The calculator
+finds the held hours by binary search and sums them with array arithmetic, so a
+long holding does not make a backtest slow down quadratically.
 
 ## Maintenance
 

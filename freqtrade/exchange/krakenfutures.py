@@ -6,7 +6,8 @@ from math import isfinite
 from typing import Any
 
 import ccxt
-from pandas import DataFrame, Timestamp
+import numpy as np
+from pandas import DataFrame, DatetimeIndex, Timestamp
 
 from freqtrade.enums import CandleType, MarginMode, PriceType, TradingMode
 from freqtrade.exceptions import (
@@ -353,22 +354,28 @@ class Krakenfutures(Exchange):
                 "Kraken funding history needs absolute rates; download it again."
             )
         start, end = Timestamp(open_date), Timestamp(close_date)
-        rates = df.loc[(df["date"] >= start.floor("h")) & (df["date"] < end)].sort_values("date")
-        cursor, payment = start, 0.0
-        for row in rates.itertuples():
-            hour = row.date
-            rate = float(row.funding_rate_absolute)
-            if hour != hour.floor("h") or hour > cursor or hour + timedelta(hours=1) <= cursor:
-                raise OperationalException("Kraken funding history has a gap or duplicate hour.")
-            if not isfinite(rate):
-                raise OperationalException("Kraken funding history has a missing absolute rate.")
-            stop = min(end, hour + timedelta(hours=1))
-            payment += rate * amount * (stop - cursor).total_seconds() / 3600
-            cursor = stop
-        if cursor != end:
+        if not df["date"].is_monotonic_increasing:
+            df = df.sort_values("date")
+        # Backtests call this for every candle of an open trade, so avoid per-row Python work:
+        # find the held hours by binary search and accrue them with array arithmetic.
+        dates = DatetimeIndex(df["date"]).as_unit("ns").asi8  # nanoseconds, like Timestamp.value
+        first, last, hour = start.value, end.value, 3_600_000_000_000
+        lo = np.searchsorted(dates, first - first % hour, "left")
+        hi = np.searchsorted(dates, last, "left")
+        hours = dates[lo:hi]
+        rates = df["funding_rate_absolute"].iloc[lo:hi].to_numpy(dtype=float)
+        aligned = not (hours % hour).any() and (np.diff(hours) == hour).all()
+        if len(hours) and (hours[0] != first - first % hour or not aligned):
+            raise OperationalException("Kraken funding history has a gap or duplicate hour.")
+        if not len(hours) or hours[-1] + hour < last:
             raise OperationalException(
                 "Kraken funding history does not cover the holding interval."
             )
+        if not np.isfinite(rates).all():
+            raise OperationalException("Kraken funding history has a missing absolute rate.")
+        seconds = (np.minimum(hours + hour, last) - np.maximum(hours, first)) / 1_000_000_000
+        # A running sum adds the hours in order, like accruing them one by one.
+        payment = float(np.cumsum(rates * amount * seconds / 3600)[-1])
         return payment if is_short else -payment
 
     def _fetch_and_calculate_funding_fees(

@@ -48,6 +48,23 @@ def test_continuous_hourly_payment(mocker, default_conf, short, opened, closed, 
     assert actual == pytest.approx(payment if short else -payment)
 
 
+def test_long_holding_matches_hour_by_hour_sum(mocker, default_conf):
+    ex = get_patched_exchange(mocker, default_conf, exchange="krakenfutures")
+    absolute = [((i * 37) % 11 - 5) / 1000 for i in range(24 * 90)]
+    frame = pd.DataFrame(
+        {
+            "date": pd.date_range(START, periods=len(absolute), freq="h"),
+            "funding_rate": 0.0,
+            "funding_rate_absolute": absolute,
+        }
+    )
+    opened = START + timedelta(minutes=20)
+    closed = START + timedelta(hours=len(absolute) - 1, minutes=35)
+    held = absolute[0] * 40 / 60 + sum(absolute[1:-1]) + absolute[-1] * 35 / 60
+    actual = ex.calculate_funding_fees(frame, 10, True, opened, closed)
+    assert actual == pytest.approx(10 * held)
+
+
 @pytest.mark.parametrize("problem", ["legacy", "gap", "nan", "duplicate", "late", "unaligned"])
 def test_missing_absolute_coverage_refused(mocker, default_conf, problem):
     ex = get_patched_exchange(mocker, default_conf, exchange="krakenfutures")

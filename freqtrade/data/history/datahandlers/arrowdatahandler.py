@@ -59,7 +59,8 @@ class ArrowDataHandler(IDataHandler):
         self.create_dir_if_needed(filename)
 
         self._store_dataframe(
-            data.reset_index(drop=True).loc[:, get_candle_columns(candle_type)], filename
+            data.reset_index(drop=True).loc[:, get_candle_columns(candle_type, data.columns)],
+            filename,
         )
 
     def _ohlcv_load(
@@ -91,7 +92,7 @@ class ArrowDataHandler(IDataHandler):
                 return self._empty_ohlcv_df(candle_type)
 
             pairdata = self._normalize_columns(pairdata, pair, candle_type)
-            pairdata = pairdata.astype(dtype=get_candle_dtypes(candle_type))
+            pairdata = pairdata.astype(dtype=get_candle_dtypes(candle_type, pairdata.columns))
             pairdata["date"] = pairdata["date"].dt.as_unit("ms")
             return pairdata
         except Exception as e:

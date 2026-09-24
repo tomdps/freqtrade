@@ -60,19 +60,24 @@ def ohlcv_to_dataframe(
     :return: DataFrame
     """
     logger.debug(f"Converting candle (OHLCV) data to dataframe for pair {pair}.")
-    df = DataFrame(ohlcv, columns=get_candle_columns(candle_type))
+    absolute = candle_type == CandleType.FUNDING_RATE and ohlcv and len(ohlcv[0]) == 3
+    columns = get_candle_columns(candle_type, ["funding_rate_absolute"] if absolute else [])
+    df = DataFrame(ohlcv, columns=columns)
 
     # Floor date to seconds to account for exchange imprecisions
     from freqtrade.exchange import timeframe_to_floor_freq
 
     resample_interval = timeframe_to_floor_freq(timeframe)
 
-    df["date"] = to_datetime(df["date"], unit="ms", utc=True).dt.floor(resample_interval)
+    df["date"] = to_datetime(df["date"], unit="ms", utc=True)
+    if absolute and (df["date"] != df["date"].dt.floor("h")).any():
+        raise ValueError("Absolute funding rates must start on an exact UTC hour.")
+    df["date"] = df["date"].dt.floor(resample_interval)
 
     # Some exchanges return int values for Volume and even for OHLC.
     # Convert them since TA-LIB indicators used in the strategy assume floats
     # and fail with exception...
-    df = df.astype(dtype=get_candle_dtypes(candle_type))
+    df = df.astype(dtype=get_candle_dtypes(candle_type, df.columns))
     return clean_ohlcv_dataframe(
         df,
         timeframe,
@@ -107,9 +112,15 @@ def clean_ohlcv_dataframe(
     :param candle_type: Candle type to use (spot, futures, funding_rate, ...)
     :return: DataFrame
     """
+    if candle_type == CandleType.FUNDING_RATE and "funding_rate_absolute" in dataframe:
+        if (dataframe["date"] != dataframe["date"].dt.floor("h")).any():
+            raise ValueError("Absolute funding rates must start on an exact UTC hour.")
+        columns = ["funding_rate", "funding_rate_absolute"]
+        if (dataframe.groupby("date")[columns].nunique(dropna=False) > 1).any().any():
+            raise ValueError("Conflicting funding rates for the same hour.")
     # group by index and aggregate results to eliminate duplicate ticks
     dataframe = dataframe.groupby(by="date", as_index=False, sort=True).agg(
-        get_candle_agg_dict(candle_type)
+        get_candle_agg_dict(candle_type, dataframe.columns)
     )
     # eliminate partial candle
     if drop_incomplete:

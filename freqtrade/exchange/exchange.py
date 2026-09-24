@@ -1225,6 +1225,8 @@ class Exchange:
                     "cost": (_amount * average),
                 }
             )
+            if self.get_option("funding_fee_continuous", False) is True:
+                dry_order["lastTradeTimestamp"] = dt_ts()
             # market orders will always incurr taker fees
             dry_order = self.add_dry_order_fee(pair, dry_order, "taker")
 
@@ -1367,6 +1369,8 @@ class Exchange:
                         "cost": order["amount"] * average,
                     }
                 )
+                if self.get_option("funding_fee_continuous", False) is True:
+                    order["lastTradeTimestamp"] = dt_ts()
                 self.add_dry_order_fee(
                     pair,
                     order,
@@ -1388,6 +1392,8 @@ class Exchange:
                     }
                 )
 
+                if self.get_option("funding_fee_continuous", False) is True:
+                    order["lastTradeTimestamp"] = dt_ts()
                 self.add_dry_order_fee(
                     pair,
                     order,

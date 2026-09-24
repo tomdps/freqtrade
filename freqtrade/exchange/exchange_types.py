@@ -53,6 +53,7 @@ class FtHas(TypedDict, total=False):
     ccxt_futures_name: str  # usually swap
     mark_ohlcv_price: str
     mark_ohlcv_timeframe: str
+    funding_fee_continuous: bool
     funding_fee_timeframe: str
     funding_fee_candle_limit: int
     floor_leverage: bool

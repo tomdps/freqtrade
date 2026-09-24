@@ -826,6 +826,16 @@ class LocalTrade:
         prior_funding_fees = sum([o.funding_fee for o in self.orders if o.funding_fee])
         self.funding_fees = prior_funding_fees + funding_fee
 
+    @property
+    def funding_fees_since_last_exit(self) -> float:
+        """Funding available in the wallet but not included in realized trade profit."""
+        funding = self.funding_fee_running or 0.0
+        for order in reversed(self.select_filled_orders()):
+            if order.ft_order_side != self.entry_side:
+                break
+            funding += order.funding_fee or 0.0
+        return funding
+
     def __set_stop_loss(self, stop_loss: float, percent: float):
         """
         Method used internally to set self.stop_loss.
@@ -919,7 +929,10 @@ class LocalTrade:
             return
 
         logger.info(f"Updating trade (id={self.id}) ...")
-        if order.ft_order_side != "stoploss":
+        if self.exchange == "krakenfutures" and order.funding_fee is None:
+            order.funding_fee = self.funding_fee_running
+            self.funding_fee_running = 0.0
+        elif self.exchange != "krakenfutures" and order.ft_order_side != "stoploss":
             order.funding_fee = self.funding_fee_running
             # Reset running funding fees
             self.funding_fee_running = 0.0
@@ -1100,10 +1113,13 @@ class LocalTrade:
         else:
             return close_value - fees
 
-    def calc_close_trade_value(self, rate: float, amount: float | None = None) -> float:
+    def calc_close_trade_value(
+        self, rate: float, amount: float | None = None, *, funding_fees: float | None = None
+    ) -> float:
         """
         Calculate the Trade's close value including fees
         :param rate: rate to compare with.
+        :param funding_fees: Explicit funding for a historical exit being recalculated.
         :return: value in stake currency of the open trade
         """
         if rate is None and not self.close_rate:
@@ -1126,7 +1142,12 @@ class LocalTrade:
                 return float(self._calc_base_close(amount1, rate, self.fee_close) - total_interest)
 
         elif trading_mode == TradingMode.FUTURES:
-            funding_fees = self.funding_fees or 0.0
+            if funding_fees is None:
+                funding_fees = (
+                    self.funding_fees_since_last_exit
+                    if self.exchange == "krakenfutures" and self.is_open
+                    else self.funding_fees or 0.0
+                )
             # Positive funding_fees -> Trade has gained from fees.
             # Negative funding_fees -> Trade had to pay the fees.
             if self.is_short:
@@ -1153,7 +1174,12 @@ class LocalTrade:
         return prof.profit_abs
 
     def calculate_profit(
-        self, rate: float, amount: float | None = None, open_rate: float | None = None
+        self,
+        rate: float,
+        amount: float | None = None,
+        open_rate: float | None = None,
+        *,
+        funding_fees: float | None = None,
     ) -> ProfitStruct:
         """
         Calculate profit metrics (absolute, ratio, total, total ratio).
@@ -1161,10 +1187,11 @@ class LocalTrade:
         :param rate: close rate to compare with.
         :param amount: Amount to use for the calculation. Falls back to trade.amount if not set.
         :param open_rate: open_rate to use. Defaults to self.open_rate if not provided.
+        :param funding_fees: Explicit funding for a historical exit being recalculated.
         :return: Profit structure, containing absolute and relative profits.
         """
 
-        close_trade_value = self.calc_close_trade_value(rate, amount)
+        close_trade_value = self.calc_close_trade_value(rate, amount, funding_fees=funding_fees)
         if amount is None or open_rate is None:
             open_trade_value = self.open_trade_value
         else:
@@ -1301,7 +1328,9 @@ class LocalTrade:
                 self.funding_fees = current_funding_fee
                 exit_rate = o.safe_price
                 exit_amount = o.safe_amount_after_fee
-                prof = self.calculate_profit(exit_rate, exit_amount, float(avg_price))
+                prof = self.calculate_profit(
+                    exit_rate, exit_amount, float(avg_price), funding_fees=current_funding_fee
+                )
                 close_profit_abs += prof.profit_abs
                 if total_stake > 0:
                     # This needs to be calculated based on the last occurring exit to be aligned

@@ -1,15 +1,16 @@
 """Kraken Futures exchange subclass"""
 
 import logging
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
+from math import isfinite
 from typing import Any
 
 import ccxt
+from pandas import DataFrame, Timestamp
 
-from freqtrade.enums import MarginMode, PriceType, TradingMode
+from freqtrade.enums import CandleType, MarginMode, PriceType, TradingMode
 from freqtrade.exceptions import (
     DDosProtection,
-    ExchangeError,
     InvalidOrderException,
     OperationalException,
     TemporaryError,
@@ -40,6 +41,7 @@ class Krakenfutures(Exchange):
 
     _ft_has: FtHas = {
         "tickers_have_quoteVolume": False,
+        "funding_fee_continuous": True,
         "stoploss_on_exchange": True,
         "stoploss_order_types": {
             "limit": "limit",
@@ -299,11 +301,109 @@ class Krakenfutures(Exchange):
             raise OperationalException(e) from e
         return None
 
-    def get_funding_fees(self, pair: str, amount: float, is_short: bool, open_date) -> float:
-        """Fetch funding fees, returning 0.0 if retrieval fails."""
-        if self.trading_mode == TradingMode.FUTURES:
+    async def _fetch_funding_rate_history(
+        self, pair: str, timeframe: str, limit: int, since_ms: int | None = None
+    ) -> list[list]:
+        """Keep relative signals and the exchange's USD hourly payment per base unit."""
+        rates = await self._api_async.fetch_funding_rate_history(pair, since=since_ms, limit=limit)
+        result, seen = [], set()
+        for row in rates:
             try:
-                return self._fetch_and_calculate_funding_fees(pair, amount, is_short, open_date)
-            except ExchangeError:
-                logger.warning(f"Could not update funding fees for {pair}.")
+                timestamp = int(row["timestamp"])
+                relative = float(row["fundingRate"])
+                absolute = float(row.get("info", {}).get("fundingRate"))
+            except (TypeError, ValueError, KeyError) as exc:
+                raise OperationalException("Kraken funding response has missing rates.") from exc
+            if (
+                timestamp % 3600000
+                or timestamp in seen
+                or not all(map(isfinite, [relative, absolute]))
+            ):
+                raise OperationalException("Kraken funding response has invalid hours or rates.")
+            seen.add(timestamp)
+            result.append([timestamp, relative, absolute])
+        return result
+
+    @staticmethod
+    def combine_funding_and_mark(
+        funding_rates: DataFrame, mark_rates: DataFrame, futures_funding_rate: int | None = None
+    ) -> DataFrame:
+        """Absolute payments do not require a mark-price approximation."""
+        if "funding_rate_absolute" not in funding_rates:
+            raise OperationalException(
+                "Kraken funding history needs absolute rates; download it again."
+            )
+        return funding_rates[["date", "funding_rate_absolute"]].copy()
+
+    def calculate_funding_fees(
+        self,
+        df: DataFrame,
+        amount: float,
+        is_short: bool,
+        open_date: datetime,
+        close_date: datetime,
+    ) -> float:
+        """Accrue each hourly absolute rate over its half-open holding interval."""
+        if close_date < open_date or amount < 0 or not isfinite(amount):
+            raise OperationalException("Invalid Kraken funding holding interval or amount.")
+        if not amount or close_date == open_date:
+            return 0.0
+        if "funding_rate_absolute" not in df:
+            raise OperationalException(
+                "Kraken funding history needs absolute rates; download it again."
+            )
+        start, end = Timestamp(open_date), Timestamp(close_date)
+        rates = df.loc[(df["date"] >= start.floor("h")) & (df["date"] < end)].sort_values("date")
+        cursor, payment = start, 0.0
+        for row in rates.itertuples():
+            hour = row.date
+            rate = float(row.funding_rate_absolute)
+            if hour != hour.floor("h") or hour > cursor or hour + timedelta(hours=1) <= cursor:
+                raise OperationalException("Kraken funding history has a gap or duplicate hour.")
+            if not isfinite(rate):
+                raise OperationalException("Kraken funding history has a missing absolute rate.")
+            stop = min(end, hour + timedelta(hours=1))
+            payment += rate * amount * (stop - cursor).total_seconds() / 3600
+            cursor = stop
+        if cursor != end:
+            raise OperationalException(
+                "Kraken funding history does not cover the holding interval."
+            )
+        return payment if is_short else -payment
+
+    def _fetch_and_calculate_funding_fees(
+        self,
+        pair: str,
+        amount: float,
+        is_short: bool,
+        open_date: datetime,
+        close_date: datetime | None = None,
+    ) -> float:
+        """Use public hourly absolute rates; unavailable coverage is never a zero payment."""
+        close_date = close_date or datetime.now(UTC)
+        if not amount or close_date == open_date:
+            return 0.0
+        key = (pair, "1h", CandleType.FUNDING_RATE)
+        cache = getattr(self, "_funding_rate_cache", {})
+        rates = cache.get(pair)
+        first = Timestamp(open_date).floor("h")
+        last = (Timestamp(close_date) - timedelta(microseconds=1)).floor("h")
+        if rates is None or rates.empty or rates.date.min() > first or rates.date.max() < last:
+            histories = self.refresh_latest_ohlcv(
+                [key],
+                since_ms=int(first.timestamp() * 1000),
+                cache=False,
+                drop_incomplete=False,
+            )
+            if key not in histories:
+                raise OperationalException(f"Kraken funding history is unavailable for {pair}.")
+            rates = histories[key]
+            cache[pair] = rates
+            self._funding_rate_cache = cache
+        return self.calculate_funding_fees(rates, amount, is_short, open_date, close_date)
+
+    def get_funding_fees(self, pair: str, amount: float, is_short: bool, open_date) -> float:
+        """Calculate continuous funding; never replace missing payments with zero."""
+        if self.trading_mode == TradingMode.FUTURES:
+            return self._fetch_and_calculate_funding_fees(pair, amount, is_short, open_date)
         return 0.0

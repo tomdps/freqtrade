@@ -135,6 +135,8 @@ def test_datahandler_normalize_columns_bad_width(testdatadir, width):
     dh = JsonDataHandler(testdatadir)
     df = DataFrame([[0] * width]) if width else DataFrame()
     for candle_type in (CandleType.FUNDING_RATE, CandleType.SPOT):
+        if candle_type == CandleType.FUNDING_RATE and width == 3:
+            continue  # Optional absolute funding rate.
         with pytest.raises(ValueError, match=r"Unexpected column count .* for XRP/USDT:USDT"):
             dh._normalize_columns(df, "XRP/USDT:USDT", candle_type)
 

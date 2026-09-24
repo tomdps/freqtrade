@@ -10,6 +10,8 @@ It is deliberately dependency-free (no pandas) so that `freqtrade.constants` can
 re-export from it without pulling pandas into every import of the bot.
 """
 
+from collections.abc import Collection
+
 from freqtrade.enums import CandleType
 
 
@@ -33,40 +35,48 @@ FUNDING_RATE_LEGACY_RENAME = {"open": "funding_rate"}
 # Every column that can legitimately hold candle data. Used to keep such columns out of
 # dtype downcasting.
 ALL_CANDLE_VALUE_COLUMNS: frozenset[str] = frozenset(
-    {"open", "high", "low", "close", "volume", "funding_rate"}
+    {"open", "high", "low", "close", "volume", "funding_rate", "funding_rate_absolute"}
 )
 
 
-def get_candle_columns(candle_type: CandleType | str | None) -> list[str]:
+def get_candle_columns(
+    candle_type: CandleType | str | None, available: Collection[str] = ()
+) -> list[str]:
     """
     Columns persisted on disk for this candle type - always starting with "date".
     Accepts plain strings and None (DataProvider and informative pairs use "" for spot).
     :param candle_type: Candle type to use (spot, futures, funding_rate, ...)
     :return: List of column names
     """
+    if candle_type == CandleType.FUNDING_RATE and "funding_rate_absolute" in available:
+        return [*_FUNDING_RATE_COLUMNS, "funding_rate_absolute"]
     if not candle_type:
         return OHLCV_COLUMNS
     return _CANDLE_TYPE_COLUMNS.get(candle_type, OHLCV_COLUMNS)
 
 
-def get_candle_dtypes(candle_type: CandleType | str | None) -> dict[str, str]:
+def get_candle_dtypes(
+    candle_type: CandleType | str | None, available: Collection[str] = ()
+) -> dict[str, str]:
     """
     astype() mapping for the value columns of this candle type.
     Some exchanges return ints for values TA-LIB expects to be floats.
     :param candle_type: Candle type to use (spot, futures, funding_rate, ...)
     :return: Mapping of column name to dtype, excluding "date"
     """
-    return {col: "float" for col in get_candle_columns(candle_type)[1:]}
+    return {col: "float" for col in get_candle_columns(candle_type, available)[1:]}
 
 
-def get_candle_agg_dict(candle_type: CandleType | str | None) -> dict[str, str]:
+def get_candle_agg_dict(
+    candle_type: CandleType | str | None, available: Collection[str] = ()
+) -> dict[str, str]:
     """
     groupby("date") aggregation used to eliminate duplicate candles.
     Single-value candle types have nothing to aggregate, so they take the first value.
     :param candle_type: Candle type to use (spot, futures, funding_rate, ...)
     :return: Mapping of column name to aggregation function
     """
-    columns = get_candle_columns(candle_type)
+    columns = get_candle_columns(candle_type, available)
     if columns is OHLCV_COLUMNS:
         return dict(_OHLCV_AGG)
     return {col: "first" for col in columns[1:]}

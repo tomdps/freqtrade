@@ -17,6 +17,7 @@ concurrency:
 
 jobs:
   build-docs:
+    if: github.repository == 'freqtrade/freqtrade'
     permissions:
       contents: write  #  for mike to push
     name: Deploy Docs through mike

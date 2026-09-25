@@ -2,6 +2,7 @@
 
 import logging
 from datetime import UTC, datetime, timedelta
+from functools import cached_property
 from math import isfinite
 from typing import Any
 
@@ -353,30 +354,26 @@ class Krakenfutures(Exchange):
             raise OperationalException(
                 "Kraken funding history needs absolute rates; download it again."
             )
-        start, end = Timestamp(open_date), Timestamp(close_date)
-        if not df["date"].is_monotonic_increasing:
-            df = df.sort_values("date")
-        # Backtests call this for every candle of an open trade, so avoid per-row Python work:
-        # find the held hours by binary search and accrue them with array arithmetic.
-        dates = DatetimeIndex(df["date"]).as_unit("ns").asi8  # nanoseconds, like Timestamp.value
-        first, last, hour = start.value, end.value, 3_600_000_000_000
-        lo = np.searchsorted(dates, first - first % hour, "left")
-        hi = np.searchsorted(dates, last, "left")
-        hours = dates[lo:hi]
-        rates = df["funding_rate_absolute"].iloc[lo:hi].to_numpy(dtype=float)
-        aligned = not (hours % hour).any() and (np.diff(hours) == hour).all()
-        if len(hours) and (hours[0] != first - first % hour or not aligned):
-            raise OperationalException("Kraken funding history has a gap or duplicate hour.")
-        if not len(hours) or hours[-1] + hour < last:
-            raise OperationalException(
-                "Kraken funding history does not cover the holding interval."
-            )
-        if not np.isfinite(rates).all():
-            raise OperationalException("Kraken funding history has a missing absolute rate.")
-        seconds = (np.minimum(hours + hour, last) - np.maximum(hours, first)) / 1_000_000_000
-        # A running sum adds the hours in order, like accruing them one by one.
-        payment = float(np.cumsum(rates * amount * seconds / 3600)[-1])
+        table = self._funding_table(df)
+        payment = table.payment(amount, Timestamp(open_date).value, Timestamp(close_date).value)
         return payment if is_short else -payment
+
+    @cached_property
+    def _funding_tables(self) -> dict[int, "_FundingTable"]:
+        return {}
+
+    def _funding_table(self, df: DataFrame) -> "_FundingTable":
+        """Backtests ask about the same history at every candle: prepare it once per frame.
+
+        Funding frames are never edited in place: backtests build them once and dry runs fetch
+        new ones. A table keeps its frame alive, so no other frame can take its id meanwhile.
+        """
+        table = self._funding_tables.get(id(df))
+        if table is None:
+            if len(self._funding_tables) > 64:
+                self._funding_tables.clear()
+            table = self._funding_tables[id(df)] = _FundingTable(df)
+        return table
 
     def _fetch_and_calculate_funding_fees(
         self,
@@ -414,3 +411,68 @@ class Krakenfutures(Exchange):
         if self.trading_mode == TradingMode.FUTURES:
             return self._fetch_and_calculate_funding_fees(pair, amount, is_short, open_date)
         return 0.0
+
+
+_HOUR = 3_600_000_000_000  # nanoseconds
+
+
+class _FundingTable:
+    """Hourly absolute rates of one pair, checked once, with each open position's running sum.
+
+    A position's funding is the sum, in time order, of rate * amount * seconds held / 3600 over
+    its hours. Hours already fully held never change, so their sum is kept and only new hours
+    are added: the same additions in the same order as summing everything again.
+    """
+
+    def __init__(self, df: DataFrame) -> None:
+        self.df = df  # the frame this table describes (it keeps its id unique)
+        if not df["date"].is_monotonic_increasing:
+            df = df.sort_values("date")
+        self.dates = DatetimeIndex(df["date"]).as_unit("ns").asi8
+        self.rates = df["funding_rate_absolute"].to_numpy(dtype=float)
+        # Running counts of problems, to check any range of rows in constant time.
+        self.misaligned = np.concatenate([[0], np.cumsum(self.dates % _HOUR != 0)])
+        self.gaps = np.concatenate([[0, 0], np.cumsum(np.diff(self.dates) != _HOUR)])
+        self.missing = np.concatenate([[0], np.cumsum(~np.isfinite(self.rates))])
+        self.sums: dict[tuple[float, int], tuple[int, float]] = {}
+
+    def payment(self, amount: float, first: int, last: int) -> float:
+        start_hour = first - first % _HOUR
+        lo = int(np.searchsorted(self.dates, start_hour, "left"))
+        hi = int(np.searchsorted(self.dates, last, "left"))
+        if hi > lo:
+            aligned = self.misaligned[hi] == self.misaligned[lo] and (
+                hi - lo < 2 or self.gaps[hi] == self.gaps[lo + 1]
+            )
+            if self.dates[lo] != start_hour or not aligned:
+                raise OperationalException("Kraken funding history has a gap or duplicate hour.")
+        if hi == lo or self.dates[hi - 1] + _HOUR < last:
+            raise OperationalException(
+                "Kraken funding history does not cover the holding interval."
+            )
+        if self.missing[hi] != self.missing[lo]:
+            raise OperationalException("Kraken funding history has a missing absolute rate.")
+        # Hours lo..full-1 are held in full up to `last`; at most one partial hour follows.
+        full = min(hi, max(lo, int(np.searchsorted(self.dates, last - _HOUR, "right"))))
+        # -0.0 leaves the first addition unchanged, sign of zero included, like the old sum.
+        done, total = self.sums.get((amount, first), (lo, -0.0))
+        if not lo <= done <= full:
+            done, total = lo, -0.0
+        total = self._add(total, amount, first, last, done, full)
+        if len(self.sums) > 256:
+            self.sums.clear()
+        self.sums[amount, first] = (full, total)
+        return self._add(total, amount, first, last, full, hi)
+
+    def _add(self, total: float, amount: float, first: int, last: int, lo: int, hi: int) -> float:
+        """Add hours lo..hi-1 to a running total, one by one in time order."""
+        if hi <= lo:
+            return total
+        if hi - lo == 1:  # the usual case in a backtest: the hour in progress, without numpy
+            hour = int(self.dates[lo])
+            seconds = (min(hour + _HOUR, last) - max(hour, first)) / 1_000_000_000
+            return total + float(self.rates[lo]) * amount * seconds / 3600
+        hours = self.dates[lo:hi]
+        seconds = (np.minimum(hours + _HOUR, last) - np.maximum(hours, first)) / 1_000_000_000
+        terms = self.rates[lo:hi] * amount * seconds / 3600
+        return float(np.cumsum(np.concatenate([[total], terms]))[-1])

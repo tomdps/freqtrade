@@ -1657,9 +1657,10 @@ class Backtesting:
     def _update_continuous_funding(self, current_time: datetime, capture: bool = False) -> None:
         """Refresh every open exposure before callbacks or shared-wallet decisions."""
         if self.exchange.get_option("funding_fee_continuous", False) is True:
-            for trade in LocalTrade.bt_trades_open:
-                self._run_funding_fees(trade, current_time)
-            self.wallets.update()
+            if LocalTrade.bt_trades_open:  # otherwise nothing accrues and the wallet is current
+                for trade in LocalTrade.bt_trades_open:
+                    self._run_funding_fees(trade, current_time)
+                self.wallets.update()
             if capture:
                 self._capture_wallet(current_time, self.strategy.config["stake_currency"], 1)
 

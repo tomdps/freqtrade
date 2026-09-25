@@ -65,6 +65,55 @@ def test_long_holding_matches_hour_by_hour_sum(mocker, default_conf):
     assert actual == pytest.approx(10 * held)
 
 
+def hour_by_hour(frame, amount, opened, closed):
+    """Reference: each held part of an hour, added one by one in time order."""
+    total = 0.0
+    for hour, rate in zip(frame["date"], frame["funding_rate_absolute"], strict=True):
+        start, end = max(hour, pd.Timestamp(opened)), min(hour + timedelta(hours=1), closed)
+        if end > start:
+            total += rate * amount * ((end - start).value / 1_000_000_000) / 3600
+    return total
+
+
+def test_repeated_calls_equal_one_calculation_over_the_holding(mocker, default_conf):
+    """Backtests ask about the same holding at every candle; running totals must not drift."""
+    ex = get_patched_exchange(mocker, default_conf, exchange="krakenfutures")
+    absolute = [((i * 37) % 11 - 5) / 1000 for i in range(24 * 10)]
+    frame = pd.DataFrame(
+        {
+            "date": pd.date_range(START, periods=len(absolute), freq="h"),
+            "funding_rate": 0.0,
+            "funding_rate_absolute": absolute,
+        }
+    )
+    for amount, short, opened in [(10, False, 20), (0.37, True, 0), (3.5, False, 59)]:
+        open_date = START + timedelta(minutes=opened)
+        # Minute steps, whole hours, a jump of several days, and a step back in time.
+        for minutes in (1, 40, 41, 60, 61, 125, 600, 599, 3000, 3001, 2):
+            close_date = open_date + timedelta(minutes=minutes)
+            payment = hour_by_hour(frame, amount, open_date, close_date)
+            actual = ex.calculate_funding_fees(frame, amount, short, open_date, close_date)
+            assert actual == (payment if short else -payment)
+
+
+def test_gap_after_already_summed_hours_is_refused(mocker, default_conf):
+    ex = get_patched_exchange(mocker, default_conf, exchange="krakenfutures")
+    frame = rates().drop(index=2)
+    opened = START + timedelta(minutes=10)
+    assert ex.calculate_funding_fees(frame, 10, False, opened, START + timedelta(minutes=110))
+    with pytest.raises(OperationalException, match="gap or duplicate"):
+        ex.calculate_funding_fees(frame, 10, False, opened, START + timedelta(minutes=210))
+
+
+def test_other_funding_frame_is_not_answered_from_saved_totals(mocker, default_conf):
+    ex = get_patched_exchange(mocker, default_conf, exchange="krakenfutures")
+    doubled = rates()
+    doubled["funding_rate_absolute"] *= 2
+    closed = START + timedelta(hours=3)
+    single = ex.calculate_funding_fees(rates(), 10, True, START, closed)
+    assert ex.calculate_funding_fees(doubled, 10, True, START, closed) == pytest.approx(2 * single)
+
+
 @pytest.mark.parametrize("problem", ["legacy", "gap", "nan", "duplicate", "late", "unaligned"])
 def test_missing_absolute_coverage_refused(mocker, default_conf, problem):
     ex = get_patched_exchange(mocker, default_conf, exchange="krakenfutures")

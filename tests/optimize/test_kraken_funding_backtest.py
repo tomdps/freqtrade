@@ -349,3 +349,56 @@ def test_kraken_detail_funding_stops_at_requested_backtest_end(mocker, default_c
     assert trade.funding_fees == pytest.approx(expected_funding)
     assert result["results"].iloc[0]["profit_abs"] == pytest.approx(expected_funding)
     assert result["final_balance"] == pytest.approx(3000 + expected_funding, abs=1e-9, rel=0)
+
+
+def test_kraken_detail_records_the_wallet_while_flat(mocker, default_conf_usdt):
+    """Detail minutes without an open trade skip the funding refresh, not the wallet record."""
+    pair = "COIN/USD:USD"
+    default_conf_usdt["timeframe_detail"] = "1m"
+    backtesting = _backtesting(mocker, default_conf_usdt, [pair])
+    strategy = backtesting.strategylist[0]
+    backtesting._set_strategy(strategy)
+
+    def entry_signal(frame, metadata):
+        frame["enter_long"] = (frame["date"] == _at("09:55")).astype(int)
+        return frame
+
+    def exit_signal(frame, metadata):
+        frame["exit_long"] = (frame["date"] == _at("10:05")).astype(int)
+        return frame
+
+    strategy.populate_entry_trend = entry_signal
+    strategy.populate_exit_trend = exit_signal
+    candles = pd.DataFrame(
+        {
+            "date": pd.date_range(_at("09:50"), _at("10:40"), freq="1min"),
+            "open": 100.0,
+            "high": 100.0,
+            "low": 100.0,
+            "close": 100.0,
+            "volume": 1000.0,
+        }
+    )
+    backtesting.detail_data[pair] = candles.copy()
+    backtesting.futures_data[pair] = pd.DataFrame(
+        {"date": [_at("09:00"), _at("10:00")], "funding_rate_absolute": 0.01}
+    )
+    refresh = mocker.spy(backtesting.wallets, "update")
+    result = backtesting.backtest(
+        processed={pair: candles.iloc[::5].copy()}, start_date=_at("09:50"), end_date=_at("10:40")
+    )
+
+    trade = result["results"].iloc[0]
+    assert len(result["results"]) == 1
+    assert (trade["open_date"], trade["close_date"]) == (_at("10:00"), _at("10:10"))
+    recorded = {}
+    for date, currency, _, total in backtesting.wallet_captures:
+        if currency == "USD":
+            recorded[date] = total
+    minutes = pd.date_range(_at("09:55"), _at("10:40"), freq="1min")
+    assert set(minutes) <= set(recorded)
+    assert all(recorded[m] == 3000 for m in minutes if m <= _at("10:00"))
+    closed = 3000 + trade["profit_abs"]
+    assert all(recorded[m] == pytest.approx(closed, abs=1e-9) for m in minutes if m > _at("10:10"))
+    # Refreshed only while a trade is open, not once per flat minute.
+    assert refresh.call_count < len(minutes)

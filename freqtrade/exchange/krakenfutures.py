@@ -363,9 +363,13 @@ class Krakenfutures(Exchange):
         return {}
 
     def _funding_table(self, df: DataFrame) -> "_FundingTable":
-        """Backtests ask about the same history at every candle: prepare it once per frame."""
+        """Backtests ask about the same history at every candle: prepare it once per frame.
+
+        Funding frames are never edited in place: backtests build them once and dry runs fetch
+        new ones. A table keeps its frame alive, so no other frame can take its id meanwhile.
+        """
         table = self._funding_tables.get(id(df))
-        if table is None or table.df is not df or len(table.dates) != len(df):
+        if table is None:
             if len(self._funding_tables) > 64:
                 self._funding_tables.clear()
             table = self._funding_tables[id(df)] = _FundingTable(df)
@@ -450,9 +454,10 @@ class _FundingTable:
             raise OperationalException("Kraken funding history has a missing absolute rate.")
         # Hours lo..full-1 are held in full up to `last`; at most one partial hour follows.
         full = min(hi, max(lo, int(np.searchsorted(self.dates, last - _HOUR, "right"))))
-        done, total = self.sums.get((amount, first), (lo, 0.0))
+        # -0.0 leaves the first addition unchanged, sign of zero included, like the old sum.
+        done, total = self.sums.get((amount, first), (lo, -0.0))
         if not lo <= done <= full:
-            done, total = lo, 0.0
+            done, total = lo, -0.0
         total = self._add(total, amount, first, last, done, full)
         if len(self.sums) > 256:
             self.sums.clear()

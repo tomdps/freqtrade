@@ -1,6 +1,6 @@
 # ![freqtrade](https://raw.githubusercontent.com/freqtrade/freqtrade/develop/docs/assets/freqtrade_poweredby.svg)
 
-This fork carries a Kraken continuous-funding correction on Freqtrade 2026.8.
+This fork carries a Kraken continuous-funding correction on Freqtrade 2026.9.
 See the [scope, data requirements and maintenance notes](docs/kraken-funding.md).
 
 [![Freqtrade CI](https://github.com/freqtrade/freqtrade/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/freqtrade/freqtrade/actions/workflows/ci.yml)

@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: "0.11.28"
           python-version: "3.12"
@@ -33,7 +33,7 @@ jobs:
           uv pip install -r requirements.txt -r requirements-hyperopt.txt -e . \
             pytest==9.1.1 pytest-asyncio==1.4.0 pytest-mock==3.15.1 \
             pytest-xdist==3.8.0 pytest-timeout==2.4.0 time-machine==3.4.0 \
-            pytest-socket==0.7.0 ruff==0.16.3
+            pytest-socket==0.7.0 ruff==0.16.8
       - name: Lint
         run: |
           ruff check freqtrade tests

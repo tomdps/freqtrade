@@ -1590,6 +1590,10 @@ def test_setup_freqai_backtesting(mocker, default_conf) -> None:
 
 
 def test_sanitize_config(default_conf_usdt):
+    default_conf_usdt["api_server"] = {
+        "jwt_secret_key": "synthetic-jwt-secret",
+        "ws_token": "synthetic-websocket-token",
+    }
     assert default_conf_usdt["exchange"]["api_key"] != "REDACTED"
     res = sanitize_config(default_conf_usdt)
     # Didn't modify original dict
@@ -1598,12 +1602,18 @@ def test_sanitize_config(default_conf_usdt):
 
     assert res["exchange"]["api_key"] == "REDACTED"
     assert res["exchange"]["secret"] == "REDACTED"
+    assert res["api_server"]["jwt_secret_key"] == "REDACTED"
+    assert res["api_server"]["ws_token"] == "REDACTED"
+    assert default_conf_usdt["api_server"]["jwt_secret_key"] == "synthetic-jwt-secret"
+    assert default_conf_usdt["api_server"]["ws_token"] == "synthetic-websocket-token"
     # Didn't add a non-existing key
     assert "accountId" not in res["exchange"]
 
     res = sanitize_config(default_conf_usdt, show_sensitive=True)
     assert res["exchange"]["api_key"] == default_conf_usdt["exchange"]["api_key"]
     assert res["exchange"]["secret"] == default_conf_usdt["exchange"]["secret"]
+    assert res["api_server"]["jwt_secret_key"] == "synthetic-jwt-secret"
+    assert res["api_server"]["ws_token"] == "synthetic-websocket-token"
 
 
 def test_remove_exchange_credentials(default_conf) -> None:

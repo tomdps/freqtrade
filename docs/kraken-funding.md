@@ -1,9 +1,13 @@
 # Kraken continuous funding
 
 This fork starts from Freqtrade 2026.9. The local package version
-`2026.9+kraken.1` identifies its Kraken funding correction. The patch targets
+`2026.9+kraken.2` identifies its Kraken funding correction. The patch targets
 backtesting and dry-run accounting; it has not been reconciled against a live
 account ledger.
+
+This version also backports [upstream PR #13644](https://github.com/freqtrade/freqtrade/pull/13644):
+default configuration exports redact the API signing secret and WebSocket token.
+Explicit `show_sensitive` output keeps upstream's existing behavior.
 
 Kraken's linear perpetual contracts accrue funding continuously. Each hourly
 rate applies from its timestamp until the next hour, and only the time actually

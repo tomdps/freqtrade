@@ -34,6 +34,7 @@ from freqtrade.exceptions import (
     InvalidOrderException,
     OperationalException,
     PricingError,
+    TemporaryError,
 )
 from freqtrade.exchange import (
     ROUND_DOWN,
@@ -386,32 +387,45 @@ class FreqtradeBot(LoggingMixin):
         if self.trading_mode == TradingMode.FUTURES:
             trades: list[Trade] = Trade.get_open_trades()
             for trade in trades:
-                if self.exchange.get_option("funding_fee_continuous", False) is True:
-                    self._update_continuous_funding(trade, datetime.now(UTC))
-                    continue
-                trade.set_funding_fees(
-                    self.exchange.get_funding_fees(
-                        pair=trade.pair,
-                        amount=trade.amount,
-                        is_short=trade.is_short,
-                        open_date=trade.date_last_filled_utc,
-                    )
-                )
+                self._refresh_funding_fees(trade)
+
+    def _refresh_funding_fees(self, trade: Trade) -> None:
+        """Bring the funding of a trade up to now."""
+        if self.exchange.get_option("funding_fee_continuous", False) is True:
+            self._update_continuous_funding(trade, datetime.now(UTC))
+            return
+        trade.set_funding_fees(
+            self.exchange.get_funding_fees(
+                pair=trade.pair,
+                amount=trade.amount,
+                is_short=trade.is_short,
+                open_date=trade.date_last_filled_utc,
+            )
+        )
 
     def _update_continuous_funding(
         self, trade: Trade, end: datetime, exclude_order: str | None = None
-    ) -> None:
-        """Accrue the unchanged exposure since its last actual fill, before mutation."""
+    ) -> bool:
+        """
+        Accrue the unchanged exposure since its last actual fill, before mutation.
+        :return: False if the exchange cannot provide the rates up to `end` yet. The funding is
+            then left as it was, for a later loop to retry.
+        """
         orders = [o for o in trade.select_filled_orders() if o.order_id != exclude_order]
         amount = sum(
             o.safe_amount_after_fee * (1 if o.ft_order_side == trade.entry_side else -1)
             for o in orders
         )
         start = max((o.order_filled_utc for o in orders), default=end)
-        funding = self.exchange._fetch_and_calculate_funding_fees(
-            trade.pair, max(0.0, amount), trade.is_short, start, end
-        )
+        try:
+            funding = self.exchange._fetch_and_calculate_funding_fees(
+                trade.pair, max(0.0, amount), trade.is_short, start, end
+            )
+        except TemporaryError as e:
+            logger.warning(f"Funding of trade {trade.id} not updated, will retry: {e}")
+            return False
         trade.set_funding_fees(funding)
+        return True
 
     def startup_backpopulate_precision(self) -> None:
         trades = Trade.get_trades([Trade.contract_size.is_(None)])
@@ -1041,16 +1055,6 @@ class FreqtradeBot(LoggingMixin):
         # Fee is applied twice because we make a LIMIT_BUY and LIMIT_SELL
         fee = self.exchange.get_fee(symbol=pair, taker_or_maker="maker")
         base_currency = self.exchange.get_pair_base_currency(pair)
-        funding_fees = (
-            self.exchange.get_funding_fees(
-                pair=pair,
-                amount=trade.amount,
-                is_short=is_short,
-                open_date=trade.date_last_filled_utc,
-            )
-            if trade
-            else 0
-        )
 
         # This is a new trade
         if trade is None:
@@ -1074,7 +1078,7 @@ class FreqtradeBot(LoggingMixin):
                 leverage=leverage,
                 is_short=is_short,
                 trading_mode=self.trading_mode,
-                funding_fees=funding_fees,
+                funding_fees=0,
                 amount_precision=self.exchange.get_precision_amount(pair),
                 price_precision=self.exchange.get_precision_price(pair),
                 precision_mode=self.exchange.precisionMode,
@@ -1086,7 +1090,7 @@ class FreqtradeBot(LoggingMixin):
 
         else:
             trade.is_open = True
-            trade.set_funding_fees(funding_fees)
+            self._refresh_funding_fees(trade)
 
         trade.orders.append(order_obj)
         trade.recalc_trade_from_orders()
@@ -1886,6 +1890,9 @@ class FreqtradeBot(LoggingMixin):
                         f"Keeping existing {trade.exit_side} order. {price=},  {amount=}"
                     )
                     return True
+            if any(o.status in constants.NON_OPEN_EXCHANGE_STATES for o in trade.open_orders):
+                logger.info(f"Keeping the filled order of {trade.pair} until it is booked.")
+                return True
             # cancel open orders of this trade if order is different
             self.cancel_open_orders_of_trade(
                 trade,
@@ -2124,14 +2131,7 @@ class FreqtradeBot(LoggingMixin):
         :param exit_check: CheckTuple with signal and reason
         :return: True if it succeeds False
         """
-        trade.set_funding_fees(
-            self.exchange.get_funding_fees(
-                pair=trade.pair,
-                amount=trade.amount,
-                is_short=trade.is_short,
-                open_date=trade.date_last_filled_utc,
-            )
-        )
+        self._refresh_funding_fees(trade)
 
         exit_type = "exit"
         exit_reason = exit_tag or exit_check.exit_reason
@@ -2424,7 +2424,11 @@ class FreqtradeBot(LoggingMixin):
                     if filled_at
                     else (existing.order_filled_utc or datetime.now(UTC))
                 )
-                self._update_continuous_funding(trade, end, exclude_order=order_id)
+                if not self._update_continuous_funding(trade, end, exclude_order=order_id):
+                    logger.info(f"Order {order_id} filled; booking it once its funding is known.")
+                    existing.ft_is_open = True  # so that manage_open_orders retries it
+                    Trade.commit()
+                    return False
 
         trade.update_order(order)
 

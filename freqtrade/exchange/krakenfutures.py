@@ -383,7 +383,12 @@ class Krakenfutures(Exchange):
         open_date: datetime,
         close_date: datetime | None = None,
     ) -> float:
-        """Use public hourly absolute rates; unavailable coverage is never a zero payment."""
+        """Use public hourly absolute rates; unavailable coverage is never a zero payment.
+
+        Kraken publishes each hour's rate just after the hour starts, and its history can be
+        briefly unreachable. Both raise TemporaryError, so a running bot can retry later; any
+        other problem in the history is an OperationalException, as in backtests.
+        """
         close_date = close_date or datetime.now(UTC)
         if not amount or close_date == open_date:
             return 0.0
@@ -400,8 +405,12 @@ class Krakenfutures(Exchange):
                 drop_incomplete=False,
             )
             if key not in histories:
-                raise OperationalException(f"Kraken funding history is unavailable for {pair}.")
+                raise TemporaryError(f"Kraken funding history is unavailable for {pair}.")
             rates = histories[key]
+            if rates.empty or rates.date.max() < last:
+                raise TemporaryError(
+                    f"Kraken has not yet published the {last} funding rate for {pair}."
+                )
             cache[pair] = rates
             self._funding_rate_cache = cache
         return self.calculate_funding_fees(rates, amount, is_short, open_date, close_date)

@@ -16,6 +16,18 @@ from tests.conftest import EXMS, patch_exchange, patch_freqtradebot
 
 START = dt_utc(2024, 1, 1, 12)
 PAIR = "ETH/USDT"
+FUNDING = (PAIR, "1h", CandleType.FUNDING_RATE)
+
+
+def history(hours: int = 4) -> pd.DataFrame:
+    """Public funding history: the first `hours` hourly rates from START."""
+    return pd.DataFrame(
+        {
+            "date": pd.date_range(START, periods=hours, freq="h"),
+            "funding_rate": [0.0001] * hours,
+            "funding_rate_absolute": [0.01] * hours,
+        }
+    )
 
 
 def make_bot(mocker, conf):
@@ -50,20 +62,7 @@ def make_bot(mocker, conf):
             "asks": [[100.0, 1000]],
         },
     )
-    df = pd.DataFrame(
-        {
-            "date": pd.date_range(START, periods=4, freq="h"),
-            "funding_rate": [0.0001] * 4,
-            "funding_rate_absolute": [0.01] * 4,
-        }
-    )
-    mocker.patch.object(
-        bot.exchange,
-        "refresh_latest_ohlcv",
-        return_value={
-            (PAIR, "1h", CandleType.FUNDING_RATE): df,
-        },
-    )
+    mocker.patch.object(bot.exchange, "refresh_latest_ohlcv", return_value={FUNDING: history()})
     return bot
 
 
@@ -275,3 +274,104 @@ def test_dry_global_callback_sees_current_funding(mocker, default_conf_usdt, tim
     bot.strategy.bot_loop_start = observe
     bot.process()
     assert observed == [pytest.approx((-0.05, 9999.95))]
+
+
+def stub_strategy_steps(mocker, bot):
+    """Run the bot loop without market data or strategy; return the exit step to count calls."""
+    mocker.patch.object(bot.dataprovider, "refresh")
+    mocker.patch.object(bot.strategy, "analyze")
+    mocker.patch.object(bot, "process_open_trade_positions")
+    mocker.patch.object(bot, "enter_positions")
+    return mocker.patch.object(bot, "exit_positions")
+
+
+@pytest.mark.parametrize("problem", ["not_yet_published", "unreachable"])
+def test_dry_funding_not_yet_available_is_retried_without_stopping(
+    mocker, default_conf_usdt, time_machine, problem
+):
+    """Kraken publishes each hour's rate a moment after the hour starts, and can be unreachable.
+
+    The bot keeps trading meanwhile and catches up with the funding on a later loop.
+    """
+    time_machine.move_to(START, tick=False)
+    bot = make_bot(mocker, default_conf_usdt)
+    exit_positions = stub_strategy_steps(mocker, bot)
+    assert bot.execute_entry(PAIR, 1000.0, ordertype="market")
+    trade = Trade.session.scalars(select(Trade)).one()
+    bot.exchange.refresh_latest_ohlcv.return_value = {FUNDING: history(2)}
+    time_machine.move_to(START + timedelta(minutes=110), tick=False)
+    bot.process()
+    assert trade.funding_fees == pytest.approx(-0.1 * 110 / 60)
+
+    if problem == "unreachable":
+        bot.exchange.refresh_latest_ohlcv.return_value = {}
+    time_machine.move_to(START + timedelta(hours=2, milliseconds=800), tick=False)
+    bot.process()
+    assert exit_positions.call_count == 2
+    assert trade.funding_fees == pytest.approx(-0.1 * 110 / 60)
+
+    bot.exchange.refresh_latest_ohlcv.return_value = {FUNDING: history(3)}
+    time_machine.move_to(START + timedelta(hours=2, seconds=5), tick=False)
+    bot.process()
+    assert trade.funding_fees == pytest.approx(-0.1 * (2 + 5 / 3600))
+
+
+def test_dry_exit_just_after_the_hour_is_booked_once_its_funding_is_published(
+    mocker, default_conf_usdt, time_machine
+):
+    """The exit fills at once and keeps its fill time; booking it waits for the hour's rate."""
+    time_machine.move_to(START, tick=False)
+    bot = make_bot(mocker, default_conf_usdt)
+    assert bot.execute_entry(PAIR, 1000.0, ordertype="market")
+    trade = Trade.session.scalars(select(Trade)).one()
+    bot.exchange.refresh_latest_ohlcv.return_value = {FUNDING: history(2)}
+    filled = START + timedelta(hours=2, milliseconds=500)
+    time_machine.move_to(filled, tick=False)
+    assert bot.execute_trade_exit(
+        trade, 100, ExitCheckTuple(ExitType.EXIT_SIGNAL), ordertype="market"
+    )
+    closing = trade.orders[-1]
+    assert trade.is_open
+    assert closing.ft_is_open
+
+    time_machine.move_to(filled + timedelta(seconds=5), tick=False)
+    bot.manage_open_orders()
+    assert trade.is_open
+    assert not bot.execute_trade_exit(
+        trade, 99, ExitCheckTuple(ExitType.STOP_LOSS), ordertype="market"
+    )
+    bot.exchange.refresh_latest_ohlcv.return_value = {FUNDING: history(3)}
+    bot.update_funding_fees()
+    bot.manage_open_orders()
+    assert not trade.is_open
+    assert trade.orders == [trade.orders[0], closing]
+    assert trade.exit_reason == ExitType.EXIT_SIGNAL.value
+    assert trade.close_date_utc == filled
+    expected = -0.1 * (2 + 0.5 / 3600)
+    assert closing.funding_fee == pytest.approx(expected)
+    assert trade.realized_profit == pytest.approx(expected)
+    bot.wallets.update()
+    assert bot.wallets.get_total("USDT") == pytest.approx(10000 + expected)
+
+
+def test_dry_added_entry_just_after_the_hour_waits_for_its_funding(
+    mocker, default_conf_usdt, time_machine
+):
+    time_machine.move_to(START, tick=False)
+    bot = make_bot(mocker, default_conf_usdt)
+    assert bot.execute_entry(PAIR, 1000.0, ordertype="market")
+    trade = Trade.session.scalars(select(Trade)).one()
+    bot.exchange.refresh_latest_ohlcv.return_value = {FUNDING: history(2)}
+    added = START + timedelta(hours=2, milliseconds=500)
+    time_machine.move_to(added, tick=False)
+    assert bot.execute_entry(PAIR, 1000.0, trade=trade, ordertype="market")
+    addition = trade.orders[-1]
+    assert addition.ft_is_open
+
+    bot.exchange.refresh_latest_ohlcv.return_value = {FUNDING: history(3)}
+    time_machine.move_to(added + timedelta(seconds=5), tick=False)
+    bot.manage_open_orders()
+    assert not addition.ft_is_open
+    assert trade.amount == 20
+    assert addition.funding_fee == pytest.approx(-0.1 * (2 + 0.5 / 3600))
+    assert trade.funding_fees == pytest.approx(-0.1 * (2 + 0.5 / 3600) - 0.2 * 5 / 3600)

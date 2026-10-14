@@ -1,7 +1,7 @@
 # Kraken continuous funding
 
 This fork starts from Freqtrade 2026.9. The local package version
-`2026.9+kraken.2` identifies its Kraken funding correction. The patch targets
+`2026.9+kraken.3` identifies its Kraken funding correction. The patch targets
 backtesting and dry-run accounting; it has not been reconciled against a live
 account ledger.
 
@@ -32,6 +32,15 @@ use profit or available balance. Tests cover elapsed-time boundaries, signs,
 rate changes, position adjustments, repeated order updates and open-position
 funding. The dry-run fill model does not establish real exchange queue priority
 or intraminute partial-fill fidelity.
+
+Kraken publishes each hourly rate shortly after the hour starts, and its history
+can be briefly unreachable. In dry-run and live trading, a funding update that
+needs a rate not yet published, or a history that cannot be fetched, keeps the
+previous funding and is retried on a later loop instead of stopping the bot. An
+order that fills in that window keeps its fill time and price, and is booked once
+the funding up to its fill is known, usually one loop later. A gap inside the
+published history still stops the bot, and backtests still refuse any history
+that does not cover a holding.
 
 Backtests ask for each open trade's funding at every candle, and at every detail
 candle with `--timeframe-detail`. The calculator prepares each funding frame once

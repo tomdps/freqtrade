@@ -386,8 +386,10 @@ class Krakenfutures(Exchange):
         """Use public hourly absolute rates; unavailable coverage is never a zero payment.
 
         Kraken publishes each hour's rate just after the hour starts, and its history can be
-        briefly unreachable. Both raise TemporaryError, so a running bot can retry later; any
-        other problem in the history is an OperationalException, as in backtests.
+        briefly unreachable. A history that cannot be fetched, or does not reach close_date yet,
+        raises TemporaryError so that a running bot can retry later. refresh_latest_ohlcv skips a
+        pair whose response fails to load, so this includes a response with invalid rows. Any
+        problem in a fetched history, such as a gap, is an OperationalException, as in backtests.
         """
         close_date = close_date or datetime.now(UTC)
         if not amount or close_date == open_date:

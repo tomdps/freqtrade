@@ -9,7 +9,7 @@ import pytest
 from freqtrade.data.converter import ohlcv_to_dataframe
 from freqtrade.data.history.datahandlers import get_datahandler
 from freqtrade.enums import CandleType
-from freqtrade.exceptions import OperationalException
+from freqtrade.exceptions import OperationalException, TemporaryError
 from freqtrade.util import dt_utc
 from tests.conftest import get_patched_exchange
 
@@ -114,7 +114,9 @@ def test_other_funding_frame_is_not_answered_from_saved_totals(mocker, default_c
     assert ex.calculate_funding_fees(doubled, 10, True, START, closed) == pytest.approx(2 * single)
 
 
-@pytest.mark.parametrize("problem", ["legacy", "gap", "nan", "duplicate", "late", "unaligned"])
+@pytest.mark.parametrize(
+    "problem", ["legacy", "gap", "nan", "duplicate", "late", "ends_early", "unaligned"]
+)
 def test_missing_absolute_coverage_refused(mocker, default_conf, problem):
     ex = get_patched_exchange(mocker, default_conf, exchange="krakenfutures")
     frame = rates()
@@ -128,6 +130,8 @@ def test_missing_absolute_coverage_refused(mocker, default_conf, problem):
         frame = pd.concat([frame, frame.iloc[[1]]])
     elif problem == "late":
         frame = frame.iloc[1:]
+    elif problem == "ends_early":
+        frame = frame.iloc[:1]
     else:
         frame.loc[1, "date"] += timedelta(minutes=1)
     with pytest.raises(OperationalException, match="Kraken funding"):
@@ -190,6 +194,36 @@ def test_hourly_cache_does_not_refetch_on_each_poll(mocker, default_conf):
     assert fetch.call_count == 1
     ex._fetch_and_calculate_funding_fees(PAIR, 10, True, START, START + timedelta(minutes=61))
     assert fetch.call_count == 2
+
+
+def test_rate_not_yet_published_or_unreachable_is_temporary(mocker, default_conf):
+    """Kraken publishes each hour's rate just after the hour starts, and can be unreachable.
+
+    A running bot asking for funding up to now must be able to retry later. A hole inside the
+    published history stays an error, like in backtests.
+    """
+    ex = get_patched_exchange(mocker, default_conf, exchange="krakenfutures")
+    key = (PAIR, "1h", CandleType.FUNDING_RATE)
+    fetch = mocker.patch.object(ex, "refresh_latest_ohlcv", return_value={key: rates().iloc[:2]})
+    on_the_hour = START + timedelta(hours=2)
+    just_after = on_the_hour + timedelta(milliseconds=800)
+    assert ex._fetch_and_calculate_funding_fees(
+        PAIR, 10, True, START, on_the_hour
+    ) == pytest.approx(10 * (0.01 - 0.02))
+    with pytest.raises(TemporaryError, match="not yet published"):
+        ex._fetch_and_calculate_funding_fees(PAIR, 10, True, START, just_after)
+    fetch.return_value = {}
+    with pytest.raises(TemporaryError, match="unavailable"):
+        ex._fetch_and_calculate_funding_fees(PAIR, 10, True, START, just_after)
+    fetch.return_value = {key: rates().iloc[:3]}
+    assert ex._fetch_and_calculate_funding_fees(PAIR, 10, True, START, just_after) == pytest.approx(
+        10 * (0.01 - 0.02 + 0.03 * 0.8 / 3600)
+    )
+    fetch.return_value = {key: rates().drop(index=1)}
+    with pytest.raises(OperationalException, match="gap"):
+        ex._fetch_and_calculate_funding_fees(
+            PAIR, 10, True, START, START + timedelta(hours=3, minutes=30)
+        )
 
 
 @pytest.mark.parametrize("problem", ["off_hour", "duplicate", "missing", "nonfinite"])

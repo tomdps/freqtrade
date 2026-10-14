@@ -2595,9 +2595,9 @@ class FreqtradeBot(LoggingMixin):
                 if not self._update_continuous_funding(trade, end, exclude_order=order_id):
                     logger.info(f"Order {order_id} filled; booking it once its funding is known.")
                     # Save the fill and its fee now, as a restart forgets dry-run fills.
-                    trade.update_order(order)
-                    self.handle_order_fee(trade, existing, order)
+                    existing.update_from_ccxt_object(order)
                     existing.ft_is_open = True  # so that manage_open_orders retries it
+                    self.handle_order_fee(trade, existing, order)
                     Trade.commit()
                     return False
 

@@ -1524,6 +1524,8 @@ class FreqtradeBot(LoggingMixin):
 
             # We check if stoploss order is fulfilled
             if stoploss_order and stoploss_order["status"] in ("closed", "triggered"):
+                if stoploss_order["status"] == "closed" and slo.ft_is_open:
+                    return True  # filled, booked once its funding is known
                 trade.exit_reason = ExitType.STOPLOSS_ON_EXCHANGE.value
                 self._notify_exit(trade, "stoploss", True, order=slo)
                 self.handle_protections(trade.pair, trade.trade_direction)
@@ -2426,6 +2428,9 @@ class FreqtradeBot(LoggingMixin):
                 )
                 if not self._update_continuous_funding(trade, end, exclude_order=order_id):
                     logger.info(f"Order {order_id} filled; booking it once its funding is known.")
+                    # Save the fill and its fee now, as a restart forgets dry-run fills.
+                    trade.update_order(order)
+                    self.handle_order_fee(trade, existing, order)
                     existing.ft_is_open = True  # so that manage_open_orders retries it
                     Trade.commit()
                     return False

@@ -32,11 +32,14 @@ or intraminute partial-fill fidelity.
 Kraken publishes each hourly rate shortly after the hour starts, and its history
 can be briefly unreachable. In dry-run and live trading, a funding update that
 needs a rate not yet published, or a history that cannot be fetched, keeps the
-previous funding and is retried on a later loop instead of stopping the bot. An
-order that fills in that window keeps its fill time and price, and is booked once
-the funding up to its fill is known, usually one loop later. A gap inside the
-published history still stops the bot, and backtests still refuse any history
-that does not cover a holding.
+previous funding and is retried on a later loop instead of stopping the bot. A
+response that cannot be read counts as a history that cannot be fetched. An order
+that fills in that window keeps its fill time, price and fee, and is booked once
+the funding up to its fill is known, usually one loop later. Until then it stays
+open, and a later exit or added entry does not replace it. If a pair's history
+stays unavailable, its funding and bookings keep waiting, with a warning on every
+loop. A gap inside the published history still stops the bot, and backtests still
+refuse any history that does not cover a holding.
 
 Backtests ask for each open trade's funding at every candle, and at every detail
 candle with `--timeframe-detail`. The calculator prepares each funding frame once

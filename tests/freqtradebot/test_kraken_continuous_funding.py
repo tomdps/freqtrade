@@ -375,3 +375,101 @@ def test_dry_added_entry_just_after_the_hour_waits_for_its_funding(
     assert trade.amount == 20
     assert addition.funding_fee == pytest.approx(-0.1 * (2 + 0.5 / 3600))
     assert trade.funding_fees == pytest.approx(-0.1 * (2 + 0.5 / 3600) - 0.2 * 5 / 3600)
+
+
+@pytest.mark.parametrize("ordertype", ["market", "limit"])
+def test_dry_fill_waiting_for_funding_survives_a_restart(
+    mocker, default_conf_usdt, time_machine, ordertype
+):
+    """A restart forgets dry-run fills, so a waiting fill is saved with its time, price and fee."""
+    time_machine.move_to(START, tick=False)
+    bot = make_bot(mocker, default_conf_usdt)
+    mocker.patch.object(
+        bot.exchange,
+        "get_fee",
+        side_effect=lambda *args, taker_or_maker="maker", **kwargs: (
+            0.0002 if taker_or_maker == "maker" else 0.0005
+        ),
+    )
+    bot.exchange.refresh_latest_ohlcv.return_value = {FUNDING: history(2)}
+    crossed = mocker.patch.object(bot.exchange, "_dry_is_price_crossed", return_value=False)
+    assert bot.execute_entry(PAIR, 1000.0, ordertype="limit")
+    trade = Trade.session.scalars(select(Trade)).one()
+    time_machine.move_to(START + timedelta(minutes=1), tick=False)
+    crossed.return_value = True
+    bot.manage_open_orders()  # the entry fills at the maker fee
+    filled = START + timedelta(hours=2, milliseconds=500)
+    if ordertype == "limit":
+        crossed.return_value = False
+        time_machine.move_to(START + timedelta(minutes=110), tick=False)
+        assert bot.execute_trade_exit(
+            trade, 101, ExitCheckTuple(ExitType.EXIT_SIGNAL), ordertype="limit"
+        )
+        time_machine.move_to(filled, tick=False)
+        crossed.return_value = True
+        bot.manage_open_orders()
+    else:
+        time_machine.move_to(filled, tick=False)
+        assert bot.execute_trade_exit(
+            trade, 100, ExitCheckTuple(ExitType.EXIT_SIGNAL), ordertype="market"
+        )
+    closing = trade.orders[-1]
+    assert closing.ft_is_open
+    assert closing.status == "closed"
+    assert not bot.execute_trade_exit(
+        trade, 99, ExitCheckTuple(ExitType.STOP_LOSS), ordertype="market"
+    )
+
+    bot.exchange._dry_run_open_orders.clear()  # restart, after the price moved back
+    Trade.session.expire_all()
+    crossed.return_value = False
+    bot.exchange.refresh_latest_ohlcv.return_value = {FUNDING: history(3)}
+    time_machine.move_to(filled + timedelta(seconds=30), tick=False)
+    bot.update_funding_fees()
+    bot.manage_open_orders()
+    assert not trade.is_open
+    assert len(trade.orders) == 2
+    assert trade.exit_reason == ExitType.EXIT_SIGNAL.value
+    assert trade.close_date_utc == filled
+    funding = -0.1 * (1 + 59 / 60 + 0.5 / 3600)
+    assert trade.funding_fees == pytest.approx(funding)
+    # Entry fee 0.2 at maker; exit fee 0.202 at maker (limit, at 101) or 0.5 at taker (market).
+    expected = 10 - 0.2 - 0.202 + funding if ordertype == "limit" else -0.2 - 0.5 + funding
+    assert trade.realized_profit == pytest.approx(expected)
+
+
+def test_dry_stop_on_exchange_waiting_for_funding_sends_one_fill_message(
+    mocker, default_conf_usdt, time_machine
+):
+    time_machine.move_to(START, tick=False)
+    bot = make_bot(mocker, default_conf_usdt)
+    assert bot.execute_entry(PAIR, 1000, ordertype="market")
+    trade = Trade.session.scalars(select(Trade)).one()
+    crossed = mocker.patch.object(bot.exchange, "_dry_is_price_crossed", return_value=False)
+    raw = bot.exchange.create_dry_run_order(
+        PAIR, "market", trade.exit_side, trade.amount, 100, 1, stop_loss=True, stop_price=90
+    )
+    stop = Order.parse_from_ccxt_object(raw, PAIR, "stoploss", trade.amount, 90)
+    trade.orders.append(stop)
+    Trade.commit()
+    bot.exchange.refresh_latest_ohlcv.return_value = {FUNDING: history(2)}
+    time_machine.move_to(START + timedelta(hours=2, milliseconds=500), tick=False)
+    crossed.return_value = True
+    mocker.patch.object(bot.exchange, "get_dry_market_fill_price", return_value=90)
+
+    def fill_messages():
+        return [
+            call.args[0]
+            for call in bot.rpc.send_msg.call_args_list
+            if call.args[0]["type"] == RPCMessageType.EXIT_FILL
+        ]
+
+    assert bot.handle_stoploss_on_exchange(trade)
+    assert trade.is_open
+    assert fill_messages() == []
+    bot.exchange.refresh_latest_ohlcv.return_value = {FUNDING: history(3)}
+    time_machine.move_to(START + timedelta(hours=2, seconds=5), tick=False)
+    assert bot.handle_stoploss_on_exchange(trade)
+    assert not trade.is_open
+    assert stop.funding_fee == pytest.approx(-0.1 * (2 + 0.5 / 3600))
+    assert len(fill_messages()) == 1

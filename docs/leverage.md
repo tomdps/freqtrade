@@ -132,11 +132,16 @@ A credit adds available cash; it does not restore margin previously spent on fun
 The native `funding_fee_cash_first` exchange capability selects this rule.
 Other exchanges and cross margin keep their existing accounting.
 
-The simulated wallet books paid entry fees immediately. Its `used` balance is the remaining
-isolated collateral, `free` is spendable cash, and `total = free + used` excludes unrealized
-price profit and loss. Position value adds that profit or loss to the remaining collateral;
+The simulated wallet books paid entry fees immediately. Its `used` balance is the sum of signed
+isolated wallet balances. It can be negative while unrealized profit keeps position equity above
+maintenance margin; funding deductions are not capped at the initial margin. `free` is spendable
+cash, and `total = free + used` excludes unrealized price profit and loss.
+Position value adds that profit or loss to the signed isolated wallet balance;
 funding is not counted a second time. Exit fees are booked at an actual exit.
 The liquidation price is recalculated when funding consumes margin, before the next exit check.
+The signed balance follows the published [USD-M liquidation formula](https://www.binance.com/en/support/faq/detail/b3c689c1f50a44cabb3a84e663b81d93).
+The public pages do not explicitly describe negative isolated-wallet settlement; this is an
+estimate from their wallet and margin equations, not a guarantee of internal exchange processing.
 In live trading, the continuously refreshed route reads the exchange's liquidation price;
 it does not substitute simulated collateral for the exchange's balance.
 

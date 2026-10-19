@@ -177,7 +177,7 @@ class Wallets:
         # Chronological payments; native trade order breaks simultaneous settlement ties.
         for date, _, _, _, trade, delta in sorted(pending, key=lambda item: item[:4]):
             if delta < 0:
-                margin_payment = min(max(0.0, -delta - max(0.0, free)), trade.isolated_collateral)
+                margin_payment = max(0.0, -delta - max(0.0, free))
                 trade.funding_fee_margin -= margin_payment
                 free += margin_payment
                 if margin_payment:

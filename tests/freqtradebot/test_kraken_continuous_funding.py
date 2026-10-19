@@ -232,6 +232,49 @@ def test_dry_funding_plus_both_order_fees(mocker, default_conf_usdt, time_machin
     assert bot.wallets.get_total("USDT") == pytest.approx(10000 + expected)
 
 
+@pytest.mark.parametrize("filled", [0.0, None, "missing"])
+@pytest.mark.parametrize("available", [True, False])
+def test_dry_canceled_unfilled_stop_preserves_funding(
+    mocker, default_conf_usdt, time_machine, filled, available
+):
+    time_machine.move_to(START, tick=False)
+    bot = make_bot(mocker, default_conf_usdt)
+    assert bot.execute_entry(PAIR, 1000, ordertype="market")
+    trade = Trade.session.scalars(select(Trade)).one()
+    mocker.patch.object(bot.exchange, "_dry_is_price_crossed", return_value=False)
+    raw = bot.exchange.create_dry_run_order(
+        PAIR, "market", trade.exit_side, trade.amount, 100, 1, stop_loss=True, stop_price=90
+    )
+    stop = Order.parse_from_ccxt_object(raw, PAIR, "stoploss", trade.amount, 90)
+    trade.orders.append(stop)
+    Trade.commit()
+    bot.exchange.refresh_latest_ohlcv.return_value = {FUNDING: history(1)}
+    time_machine.move_to(START + timedelta(minutes=30), tick=False)
+    bot.update_funding_fees()
+    bot.wallets.update()
+    assert trade.funding_fees == pytest.approx(-0.05)
+    assert bot.wallets.get_total("USDT") == pytest.approx(9999.95)
+
+    time_machine.move_to(START + timedelta(hours=1, milliseconds=500), tick=False)
+    bot.exchange.refresh_latest_ohlcv.return_value = {FUNDING: history(2 if available else 1)}
+    expected = -0.1 * (1 + 0.5 / 3600) if available else -0.05
+    canceled = {**raw, "status": "canceled", "filled": filled}
+    if filled == "missing":
+        del canceled["filled"]
+    mocker.patch.object(bot.exchange, "cancel_stoploss_order_with_result", return_value=canceled)
+    bot.cancel_stoploss_on_exchange(trade)
+    bot.update_funding_fees()
+    bot.wallets.update()
+
+    assert stop.status == "canceled"
+    assert not stop.ft_is_open
+    assert trade.is_open
+    assert trade.amount == 10
+    assert bot.wallets.get_total("USDT") == pytest.approx(10000 + expected)
+    assert trade.to_json()["funding_fees"] == pytest.approx(expected)
+    assert stop.funding_fee is None
+
+
 def test_dry_stoploss_books_funding_once(mocker, default_conf_usdt, time_machine):
     time_machine.move_to(START, tick=False)
     bot = make_bot(mocker, default_conf_usdt)

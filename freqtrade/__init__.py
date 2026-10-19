@@ -1,6 +1,6 @@
 """Freqtrade bot"""
 
-__version__ = "2026.8+kraken.5"
+__version__ = "2026.8+kraken.6"
 
 if "dev" in __version__:
     from pathlib import Path

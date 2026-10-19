@@ -4,6 +4,7 @@ import pandas as pd
 import pytest
 
 from freqtrade.enums import CandleType, RunMode
+from freqtrade.exceptions import OperationalException
 from freqtrade.optimize.backtesting import Backtesting
 from freqtrade.persistence import LocalTrade
 from tests.conftest import EXMS, patch_exchange
@@ -302,7 +303,10 @@ def test_kraken_funding_accrues_all_pairs_before_strategy_and_wallet_capture(
 
 
 @pytest.mark.parametrize("is_short", [False, True], ids=["long", "short"])
-def test_kraken_detail_funding_stops_at_requested_backtest_end(mocker, default_conf_usdt, is_short):
+@pytest.mark.parametrize("terminal_volume", [1000.0, 1.0], ids=["sufficient", "insufficient"])
+def test_kraken_detail_funding_stops_at_requested_backtest_end(
+    mocker, default_conf_usdt, is_short, terminal_volume
+):
     """An open trade closes at the requested end without reading the next funding hour."""
     pair = "COIN/USD:USD"
     default_conf_usdt["timeframe_detail"] = "1m"
@@ -333,7 +337,20 @@ def test_kraken_detail_funding_stops_at_requested_backtest_end(mocker, default_c
     backtesting.futures_data[pair] = pd.DataFrame(
         {"date": [_at("10:00")], "funding_rate_absolute": [0.01]}
     )
+    candles.loc[candles.date == _at("11:00"), "volume"] = terminal_volume
+    backtesting.detail_data[pair] = candles.copy()
     main_candles = candles.loc[candles["date"] <= _at("11:00")].iloc[::5].copy()
+    if terminal_volume < 10:
+        with pytest.raises(OperationalException, match="available volume"):
+            backtesting.backtest(
+                processed={pair: main_candles}, start_date=_at("09:50"), end_date=_at("11:00")
+            )
+        trade = LocalTrade.bt_trades_open[0]
+        assert trade.has_open_position and trade.amount == 10
+        assert len(trade.orders) == 2 and trade.orders[-1].safe_filled == 0
+        assert trade.funding_fees == pytest.approx(0.1 if is_short else -0.1)
+        assert max(date for date, *_ in backtesting.wallet_captures) == _at("11:00")
+        return
     result = backtesting.backtest(
         processed={pair: main_candles}, start_date=_at("09:50"), end_date=_at("11:00")
     )

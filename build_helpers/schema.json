@@ -13,6 +13,15 @@
       "description": "The timeframe to use (e.g `1m`, `5m`, `15m`, `30m`, `1h` ...). \nUsually specified in the strategy and missing in the configuration.",
       "type": "string"
     },
+    "backtest_end_behavior": {
+      "description": "Force an executable terminal exit or estimate positions left open.",
+      "type": "string",
+      "enum": [
+        "force_exit",
+        "mark_to_market"
+      ],
+      "default": "force_exit"
+    },
     "proxy_coin": {
       "description": "Proxy coin - must be used for specific futures modes (e.g. BNFCR)",
       "type": "string"

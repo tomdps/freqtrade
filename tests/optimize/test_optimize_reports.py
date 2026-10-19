@@ -103,8 +103,10 @@ def test_text_table_bt_results(capsys):
     )
 
 
-def test_generate_backtest_stats(default_conf, testdatadir, tmp_path):
+@pytest.mark.parametrize("end_behavior", ["force_exit", "mark_to_market"])
+def test_generate_backtest_stats(default_conf, testdatadir, tmp_path, end_behavior):
     default_conf.update({"strategy": CURRENT_TEST_STRATEGY})
+    default_conf["backtest_end_behavior"] = end_behavior
     StrategyResolver.load_strategy(default_conf)
 
     results = {
@@ -132,11 +134,12 @@ def test_generate_backtest_stats(default_conf, testdatadir, tmp_path):
                     "is_open": [False, False, False, True],
                     "is_short": [False, False, False, False],
                     "stake_amount": [0.01, 0.01, 0.01, 0.01],
+                    "orders": [[{"cost": 10}], [], [], [{"cost": 100, "filled": 0}]],
                     "exit_reason": [
                         ExitType.ROI.value,
                         ExitType.STOP_LOSS.value,
                         ExitType.ROI.value,
-                        ExitType.FORCE_EXIT.value,
+                        end_behavior,
                     ],
                 }
             ),
@@ -170,6 +173,9 @@ def test_generate_backtest_stats(default_conf, testdatadir, tmp_path):
     assert strat_stats["backtest_start"] == min_date.strftime(DATETIME_PRINT_FORMAT)
     assert strat_stats["backtest_end"] == max_date.strftime(DATETIME_PRINT_FORMAT)
     assert strat_stats["total_trades"] == len(results["DefStrat"]["results"])
+    assert strat_stats["left_open_trades"][-1]["trades"] == 1
+    assert strat_stats["total_volume"] == 10
+    assert strat_stats["backtest_end_behavior"] == end_behavior
     # Above sample had no losing trade
     assert strat_stats["max_drawdown_account"] == 0.0
 
@@ -203,7 +209,7 @@ def test_generate_backtest_stats(default_conf, testdatadir, tmp_path):
                         ExitType.ROI.value,
                         ExitType.ROI.value,
                         ExitType.STOP_LOSS.value,
-                        ExitType.FORCE_EXIT.value,
+                        end_behavior,
                     ],
                 }
             ),

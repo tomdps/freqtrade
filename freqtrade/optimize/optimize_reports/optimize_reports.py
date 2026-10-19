@@ -235,7 +235,12 @@ def calculate_trade_volume(trades_dict: list[dict[str, Any]]) -> float:
     # Aggregate the total volume traded from orders.cost.
     # Orders is a nested dictionary within the trades list.
 
-    return sum(sum(order["cost"] for order in trade.get("orders", [])) for trade in trades_dict)
+    return sum(
+        order["cost"]
+        for trade in trades_dict
+        for order in trade.get("orders", [])
+        if order.get("filled", 1) > 0
+    )
 
 
 def generate_pair_metrics(
@@ -618,7 +623,7 @@ def generate_strategy_stats(
         pairlist,
         stake_currency=stake_currency,
         starting_balance=start_balance,
-        results=results.loc[results["exit_reason"] == "force_exit"],
+        results=results.loc[(results["exit_reason"] == "force_exit") | results["is_open"]],
         min_date=min_date,
         max_date=max_date,
         skip_nan=True,
@@ -703,6 +708,8 @@ def generate_strategy_stats(
         "starting_balance": start_balance,
         "dry_run_wallet": start_balance,
         "final_balance": content["final_balance"],
+        "wallet_balance": content.get("wallet_balance", content["final_balance"]),
+        "backtest_end_behavior": config.get("backtest_end_behavior", "force_exit"),
         "rejected_signals": content["rejected_signals"],
         "timedout_entry_orders": content["timedout_entry_orders"],
         "timedout_exit_orders": content["timedout_exit_orders"],

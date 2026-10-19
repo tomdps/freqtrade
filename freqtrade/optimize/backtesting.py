@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from contextlib import nullcontext
-from copy import deepcopy
+from copy import copy, deepcopy
 from datetime import datetime, timedelta
 from math import isfinite
 from typing import TYPE_CHECKING
@@ -42,6 +42,7 @@ from freqtrade.exceptions import DependencyException, OperationalException
 from freqtrade.exchange import (
     amount_to_contract_precision,
     price_to_precision,
+    timeframe_to_prev_date,
     timeframe_to_seconds,
 )
 from freqtrade.exchange.exchange import TICK_SIZE, Exchange
@@ -76,7 +77,7 @@ from freqtrade.plugins.protectionmanager import ProtectionManager
 from freqtrade.resolvers import ExchangeResolver, StrategyResolver
 from freqtrade.strategy.interface import IStrategy
 from freqtrade.strategy.strategy_wrapper import strategy_safe_wrapper
-from freqtrade.util import FtPrecise, dt_now, get_progress_tracker
+from freqtrade.util import FtPrecise, dt_now, get_dry_run_wallet, get_progress_tracker
 from freqtrade.util.migrations import migrate_data
 from freqtrade.wallets import Wallets
 
@@ -203,6 +204,11 @@ class Backtesting:
         self.timeframe_secs = timeframe_to_seconds(self.timeframe)
         self.timeframe_min = self.timeframe_secs // 60
         self.timeframe_td = timedelta(seconds=self.timeframe_secs)
+        self._mark_to_market = (
+            self.config.get("backtest_end_behavior", "force_exit") == "mark_to_market"
+        )
+        if self._mark_to_market and self.config.get("timeframe_detail") != "1m":
+            raise OperationalException("Mark-to-market backtesting requires timeframe_detail='1m'.")
         self._is_backtest_runmode = self.dataprovider.runmode == RunMode.BACKTEST
         self.disable_database_use()
         self.init_backtest_detail()
@@ -415,6 +421,7 @@ class Backtesting:
                 fail_without_data=True,
                 data_format=self.config["dataformat_ohlcv"],
                 candle_type=self.config.get("candle_type_def", CandleType.SPOT),
+                fill_up_missing=not self._mark_to_market,
             )
         else:
             self.detail_data = {}
@@ -1421,10 +1428,11 @@ class Backtesting:
 
         return trade
 
-    def handle_left_open(self, open_trades: dict[str, list[LocalTrade]]) -> None:
+    def handle_left_open(self, open_trades: dict[str, list[LocalTrade]]) -> list[LocalTrade]:
         """
         Handling of left open trades at the end of backtesting
         """
+        valuations = []
         for pair_trades in open_trades.values():
             for trade in list(pair_trades):
                 if (
@@ -1434,9 +1442,38 @@ class Backtesting:
                     LocalTrade.remove_bt_trade(trade)
                     continue
 
+                if self._mark_to_market:
+                    detail = self.detail_data.get(trade.pair, DataFrame())
+                    if not detail.empty:
+                        # A minute's close is known only after that minute has completed.
+                        detail = detail.loc[
+                            (detail["date"] >= trade.open_date_utc)
+                            & (detail["date"] + self.timeframe_detail_td <= self._backtest_end)
+                        ]
+                        detail = detail.loc[
+                            detail["close"].map(lambda price: isfinite(price) and price > 0)
+                            & detail["volume"].map(lambda volume: isfinite(volume) and volume > 0)
+                        ]
+                    if detail.empty:
+                        raise OperationalException(
+                            f"No completed minute has a usable valuation price for {trade.pair}."
+                        )
+                    price = float(detail.sort_values("date").iloc[-1]["close"])
+                    profit = trade.calculate_profit(price)
+                    # Export-only: never close the live object, create an order, or credit cash.
+                    snapshot = copy(trade)
+                    snapshot.close_date = self._backtest_end
+                    snapshot.close_rate = price
+                    snapshot.close_profit = profit.total_profit_ratio
+                    snapshot.close_profit_abs = profit.total_profit
+                    snapshot.exit_reason = "mark_to_market"
+                    valuations.append(snapshot)
+                    continue
+
                 raise OperationalException(
                     "Cannot close an open position within the final candle's available volume."
                 )
+        return valuations
 
     def trade_slot_available(self, open_trade_count: int) -> bool:
         # Always allow trades when max_open_trades is enabled.
@@ -1774,7 +1811,9 @@ class Backtesting:
         self, current_time: datetime, pairs: list[str], end_date: datetime
     ):
         detail_end = current_time + self.timeframe_td
-        if self.exchange.get_option("funding_fee_continuous", False) is True:
+        if self._mark_to_market:
+            detail_end = min(detail_end, self._backtest_end) - self.timeframe_detail_td
+        elif self.exchange.get_option("funding_fee_continuous", False) is True:
             detail_end = min(detail_end, end_date)
         for current_time_det, is_first, has_detail, idx in self._time_generator_det(
             current_time, detail_end
@@ -1941,6 +1980,24 @@ class Backtesting:
         self.reset_backtest(self.enable_protections)
         # Ensure wallets are up-to-date (important for --strategy-list)
         self.wallets.update()
+        self._backtest_end = end_date + self.timeframe_td
+        if self._mark_to_market:
+            if self.timerange.stopdt is not None:
+                self._backtest_end = min(self._backtest_end, self.timerange.stopdt)
+            end_date = min(
+                end_date,
+                timeframe_to_prev_date(
+                    self.timeframe, self._backtest_end - timedelta(microseconds=1)
+                ),
+            )
+            processed = {
+                pair: frame.loc[frame["date"] < self._backtest_end].copy()
+                for pair, frame in processed.items()
+            }
+            self.futures_data = {
+                pair: frame.loc[frame["date"] < self._backtest_end].copy()
+                for pair, frame in self.futures_data.items()
+            }
         # Use dict of lists with data for performance
         # (looping lists is a lot faster than pandas DataFrames)
         data: dict = self._get_ohlcv_as_lists(processed)
@@ -1956,7 +2013,12 @@ class Backtesting:
             if not self._can_short or trade_dir is None:
                 # No need to reverse position if shorting is disabled or there's no new signal
                 self.backtest_loop(
-                    row, pair, current_time, trade_dir, not is_last_row, force_exit=is_last_row
+                    row,
+                    pair,
+                    current_time,
+                    trade_dir,
+                    not is_last_row,
+                    force_exit=is_last_row and not self._mark_to_market,
                 )
             else:
                 # Conditionally call backtest_loop a 2nd time if shorting is enabled,
@@ -1964,16 +2026,36 @@ class Backtesting:
 
                 for _ in (0, 1):
                     a = self.backtest_loop(
-                        row, pair, current_time, trade_dir, not is_last_row, force_exit=is_last_row
+                        row,
+                        pair,
+                        current_time,
+                        trade_dir,
+                        not is_last_row,
+                        force_exit=is_last_row and not self._mark_to_market,
                     )
                     if not a or a == trade_dir:
                         # the trade didn't close or position change is in the same direction
                         break
 
-        self.handle_left_open(LocalTrade.bt_trades_open_pp)
+        if self._mark_to_market:
+            funding_end = self._backtest_end
+            if self.exchange.get_option("funding_fee_continuous", False) is not True:
+                funding_end -= timedelta(microseconds=1)
+            for trade in LocalTrade.bt_trades_open:
+                if trade.has_open_position:
+                    self._run_funding_fees(trade, funding_end, force=True)
+        valuations = self.handle_left_open(LocalTrade.bt_trades_open_pp)
         self.wallets.update()
 
-        results = trade_list_to_dataframe(LocalTrade.bt_trades)
+        results = trade_list_to_dataframe(
+            LocalTrade.bt_trades + valuations, minified=not self._mark_to_market
+        )
+        wallet_balance = self.wallets.get_total(self.strategy.config["stake_currency"])
+        final_balance = (
+            get_dry_run_wallet(self.strategy.config) + results["profit_abs"].sum()
+            if self._mark_to_market
+            else wallet_balance
+        )
         return {
             "results": results,
             "config": self.strategy.config,
@@ -1984,7 +2066,8 @@ class Backtesting:
             "canceled_trade_entries": self.canceled_trade_entries,
             "canceled_entry_orders": self.canceled_entry_orders,
             "replaced_entry_orders": self.replaced_entry_orders,
-            "final_balance": self.wallets.get_total(self.strategy.config["stake_currency"]),
+            "final_balance": final_balance,
+            "wallet_balance": wallet_balance,
             "wallet_summary": convert_bt_wallet_collection(self.wallet_captures),
         }
 
@@ -2021,6 +2104,8 @@ class Backtesting:
             start_date=min_date,
             end_date=max_date,
         )
+        if self._mark_to_market:
+            max_date = self._backtest_end
         backtest_end_time = dt_now()
         results.update(
             {

@@ -45,6 +45,12 @@ CONF_SCHEMA = {
             ),
             "type": "string",
         },
+        "backtest_end_behavior": {
+            "description": "Force an executable terminal exit or estimate positions left open.",
+            "type": "string",
+            "enum": ["force_exit", "mark_to_market"],
+            "default": "force_exit",
+        },
         "proxy_coin": {
             "description": "Proxy coin - must be used for specific futures modes (e.g. BNFCR)",
             "type": "string",

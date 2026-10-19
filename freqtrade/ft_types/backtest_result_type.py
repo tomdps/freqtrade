@@ -49,6 +49,7 @@ class BacktestContentTypeIcomplete(TypedDict, total=False):
     canceled_entry_orders: int
     replaced_entry_orders: int
     final_balance: float
+    wallet_balance: float
     backtest_start_time: int
     backtest_end_time: int
     run_id: str

@@ -41,6 +41,27 @@ All profit calculations include fees, and freqtrade will use the exchange's defa
 Backtesting will require a starting balance, which can be provided as `--dry-run-wallet <balance>` or `--starting-balance <balance>` command line argument, or via `dry_run_wallet` configuration setting.
 This amount must be higher than `stake_amount`, otherwise the bot will not be able to simulate any trade.
 
+### Positions left open at the end
+
+The default `backtest_end_behavior` is `force_exit`: terminal orders still need an observed price and sufficient candle volume to fill. A position that cannot close causes the backtest to fail.
+
+To estimate the value of positions that remain open, set these configuration options:
+
+```json
+{
+    "backtest_end_behavior": "mark_to_market",
+    "timeframe_detail": "1m"
+}
+```
+
+In this mode, the timerange stop is exclusive. For example, `--timerange 20240101-20240201` includes January, through the minute starting at January 31, 23:59 UTC. The final main candle's remaining minutes are processed normally, including strategy exits, pending orders and liquidations. New entries remain disabled during that final main interval. Every actual fill still requires the observed price and available base-asset volume.
+
+Held positions use the latest positive, finite close from a minute candle with positive, finite trading volume, completed by the end. Missing detail candles are not filled in, and a position without a usable past quote causes the backtest to fail. A candle starting at or after the stop cannot supply its price. Funding includes only in-period settlements; continuous funding accrues through the exclusive end without using the next period's rate.
+
+Each terminal estimate is exported with `is_open: true` and `exit_reason: "mark_to_market"`. For these rows only, the legacy `close_date` and `close_timestamp` identify the valuation boundary, and `close_rate` is the past minute's closing quote. These fields do not represent an execution. Profit includes the existing estimated closing fee (`amount * close_rate * fee_close`), but no exit order is created, no closing fee is paid, and no sale proceeds are credited to the wallet. Existing orders retain their execution status in the export; an unfilled order remains unfilled.
+
+Reports include these estimates in profit metrics and the left-open table. `final_balance` is the starting balance plus reported profit, including estimated open-position profit. `wallet_balance` separately retains the native wallet's book balance. Neither an estimated profit nor the estimated closing cost changes wallet cash or held quantity.
+
 ### Dynamic stake amount
 
 Backtesting supports [dynamic stake amount](configuration.md#dynamic-stake-amount) by configuring `stake_amount` as `"unlimited"`, which will split the starting balance into `max_open_trades` pieces.

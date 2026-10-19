@@ -54,7 +54,9 @@ def trim_dictlist(dict_list, num):
     return new
 
 
-def _isolated_funding_backtest(mocker, default_conf_usdt, free_cash=100, fee=0):
+def _isolated_funding_backtest(
+    mocker, default_conf_usdt, free_cash=100, fee=0, exchange="binance", timeframe="5m"
+):
     pair = "COIN/USDT:USDT"
     config = default_conf_usdt
     config.update(
@@ -62,7 +64,7 @@ def _isolated_funding_backtest(mocker, default_conf_usdt, free_cash=100, fee=0):
         trading_mode="futures",
         margin_mode="isolated",
         candle_type_def=CandleType.FUTURES,
-        timeframe="5m",
+        timeframe=timeframe,
         timeframe_detail="1m",
         startup_candle_count=0,
         stake_amount=1000,
@@ -75,7 +77,7 @@ def _isolated_funding_backtest(mocker, default_conf_usdt, free_cash=100, fee=0):
         fee=fee,
     )
     config["exchange"] = {
-        "name": "binance",
+        "name": exchange,
         "enable_ws": False,
         "pair_whitelist": [pair],
         "pair_blacklist": [],
@@ -93,9 +95,10 @@ def _isolated_funding_backtest(mocker, default_conf_usdt, free_cash=100, fee=0):
         "inverse": False,
         "type": "swap",
         "contractSize": 1,
+        "taker": fee,
         "precision": {"amount": 8, "price": 8},
     }
-    patch_exchange(mocker, exchange="binance", mock_markets={pair: market})
+    patch_exchange(mocker, exchange=exchange, mock_markets={pair: market})
     mocker.patch(f"{EXMS}.get_min_pair_stake_amount", return_value=1)
     mocker.patch(f"{EXMS}.get_max_pair_stake_amount", return_value=float("inf"))
     mocker.patch(f"{EXMS}.get_max_leverage", return_value=1)
@@ -105,6 +108,154 @@ def _isolated_funding_backtest(mocker, default_conf_usdt, free_cash=100, fee=0):
     strategy.can_short = True
     backtesting._set_strategy(strategy)
     return pair, backtesting
+
+
+@pytest.mark.parametrize("is_short", [False, True], ids=["long", "short"])
+@pytest.mark.parametrize("case", ["discrete", "continuous", "signal-exit", "pending-exit"])
+def test_backtest_terminal_valuation_keeps_real_positions(
+    mocker, default_conf_usdt, is_short, case
+):
+    """An estimate needs a past quote, never an invented terminal execution or settlement."""
+    default_conf_usdt["backtest_end_behavior"] = "mark_to_market"
+    pair, backtesting = _isolated_funding_backtest(
+        mocker,
+        default_conf_usdt,
+        fee=0.001,
+        exchange="krakenfutures" if case == "continuous" else "binance",
+        timeframe="1h",
+    )
+    start = pd.Timestamp("2024-01-01", tz="UTC")
+    end = start + timedelta(hours=5)
+    backtesting.timerange = TimeRange.parse_timerange(f"-{int(end.timestamp())}")
+    strategy = backtesting.strategy
+    strategy.unfilledtimeout["exit"] = 120
+    side = "short" if is_short else "long"
+    strategy.populate_entry_trend = lambda frame, metadata: frame.assign(
+        **{f"enter_{side}": (frame.date == start).astype(int)}
+    )
+    strategy.populate_exit_trend = lambda frame, metadata: frame
+    exit_at = end - timedelta(minutes=30)
+    strategy.custom_exit = lambda current_time, **kwargs: (
+        "scheduled_exit" if case.endswith("exit") and current_time == exit_at else None
+    )
+    if case == "pending-exit":
+        strategy.custom_exit_price = lambda **kwargs: 99 if is_short else 101
+    candles = pd.DataFrame(
+        {
+            "date": pd.date_range(start, end + timedelta(minutes=1), freq="min"),
+            "open": 100.0,
+            "high": 100.0,
+            "low": 100.0,
+            "close": 100.0,
+            "volume": 1000.0,
+        }
+    )
+    candles.loc[candles.date >= end - timedelta(hours=1), "volume"] = 0
+    if case == "signal-exit":
+        candles.loc[candles.date == exit_at, "volume"] = 1000
+    candles.loc[candles.date == end - timedelta(hours=1, minutes=1), ["high", "close"]] = 110
+    candles.loc[candles.date == end - timedelta(minutes=1), ["high", "close"]] = 120
+    # Neither the endpoint price nor its funding event belongs to this period.
+    candles.loc[candles.date >= end, ["open", "high", "low", "close"]] = 10000
+    candles.loc[candles.date >= end, "volume"] = 1000
+    backtesting.detail_data[pair] = candles.copy()
+    if case == "continuous":
+        backtesting.futures_data[pair] = pd.DataFrame(
+            {"date": pd.date_range(start, end, freq="h"), "funding_rate_absolute": 0.5}
+        )
+        backtesting.futures_data[pair].loc[
+            lambda frame: frame.date == end, "funding_rate_absolute"
+        ] = 10000
+    else:
+        backtesting.futures_data[pair] = pd.DataFrame(
+            {
+                "date": [start + timedelta(hours=2), end - timedelta(seconds=30), end],
+                "open_mark": 100.0,
+                "open_fund": [0.01, 0.01, 10000],
+            }
+        )
+    fills = []
+    strategy.order_filled = lambda order, current_time, **kwargs: fills.append(
+        (current_time, order.ft_order_side, order.safe_filled)
+    )
+    try:
+        result = backtesting.backtest(
+            {pair: candles.iloc[::60].copy()},
+            start,
+            end,
+        )
+        exported = result["results"].iloc[0]
+        direction = 1 if is_short else -1
+        if case == "signal-exit":
+            assert not exported.is_open
+            assert exported.exit_reason == "scheduled_exit"
+            assert fills == [
+                (start + timedelta(hours=1), "sell" if is_short else "buy", 10),
+                (exit_at, "buy" if is_short else "sell", 10),
+            ]
+            assert not LocalTrade.bt_trades_open
+            assert exported.funding_fees == pytest.approx(direction * 10)
+            return
+        assert fills == [(start + timedelta(hours=1), "sell" if is_short else "buy", 10)]
+        assert not LocalTrade.bt_trades
+        trade = LocalTrade.bt_trades_open[0]
+        assert trade.is_open and trade.amount == 10
+        assert trade.close_date == (exit_at if case == "pending-exit" else None)
+        assert trade.close_rate is None
+        assert trade.nr_of_successful_exits == 0
+        assert len(trade.orders) == (2 if case == "pending-exit" else 1)
+        if case == "pending-exit":
+            assert trade.orders[-1].ft_is_open and trade.orders[-1].safe_filled == 0
+            assert exported.orders[-1]["filled"] == 0
+            assert exported.orders[-1]["is_open"]
+        assert exported.is_open and exported.exit_reason == "mark_to_market"
+        assert exported.close_date == end and exported.close_rate == 110
+        assert exported.funding_fees == pytest.approx(direction * 20)
+        expected_pnl = (-100 if is_short else 100) + direction * 20 - 1 - 1.1
+        assert exported.profit_abs == pytest.approx(expected_pnl)
+        assert result["final_balance"] == pytest.approx(1100 + expected_pnl)
+        expected_book = 1100 + direction * 20 - (0 if case == "continuous" else 1)
+        assert backtesting.wallets.get_total("USDT") == pytest.approx(expected_book)
+        assert result["wallet_balance"] == pytest.approx(expected_book)
+        assert backtesting.wallets.get_used("USDT") == 1000
+    finally:
+        backtesting.cleanup()
+
+
+@pytest.mark.parametrize("missing", [False, True], ids=["last-past-quote", "future-only-quote"])
+def test_backtest_terminal_valuation_rejects_future_prices(mocker, default_conf_usdt, missing):
+    start = pd.Timestamp("2024-01-01", tz="UTC")
+    default_conf_usdt["backtest_end_behavior"] = "mark_to_market"
+    pair, backtesting, hourly, detail, fills = _volume_backtest(
+        mocker, default_conf_usdt, "terminal-unfillable", start
+    )
+    end = start + timedelta(hours=5)
+    detail.loc[detail.date >= start + timedelta(hours=1), "volume"] = 0
+    detail.loc[detail.date == start + timedelta(hours=1), "volume"] = 1000
+    if missing:
+        detail.loc[:, "close"] = np.nan
+    else:
+        detail.loc[detail.date == end - timedelta(minutes=2), ["high", "close"]] = 110
+        detail.loc[detail.date == end - timedelta(minutes=2), "volume"] = 1
+        detail.loc[detail.date == end - timedelta(minutes=1), ["high", "close"]] = 120
+    future = (
+        detail.iloc[[-1]]
+        .copy()
+        .assign(date=end, open=10000, high=10000, low=10000, close=10000, volume=1000)
+    )
+    backtesting.detail_data[pair] = pd.concat([detail, future], ignore_index=True)
+    try:
+        if missing:
+            with pytest.raises(OperationalException, match=r"completed.*valuation price"):
+                backtesting.backtest({pair: hourly}, start, end - timedelta(hours=1))
+            assert len(fills) == 1
+        else:
+            result = backtesting.backtest({pair: hourly}, start, end - timedelta(hours=1))
+            assert result["results"].iloc[0].close_rate == 110
+            assert result["results"].iloc[0].close_date == end
+            assert len(fills) == 1
+    finally:
+        backtesting.cleanup()
 
 
 @pytest.mark.parametrize("is_short", [False, True], ids=["long", "short"])

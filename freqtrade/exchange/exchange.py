@@ -10,7 +10,7 @@ import signal
 from collections.abc import Coroutine, Generator
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
-from math import floor, isnan
+from math import floor, isfinite, isnan
 from threading import Lock
 from typing import Any, Literal, TypeGuard, TypeVar
 from uuid import uuid4
@@ -3899,7 +3899,18 @@ class Exchange:
         :param open_date: The date and time that the trade started
         :param close_date: The date and time that the trade ended
         """
+        close_date = close_date or datetime.now(UTC)
+        funding_mark_rates, open_date = self._fetch_funding_and_mark(pair, open_date)
+        return self.calculate_funding_fees(
+            funding_mark_rates,
+            amount=amount,
+            is_short=is_short,
+            open_date=open_date,
+            close_date=close_date,
+        )
 
+    def _fetch_funding_and_mark(self, pair: str, open_date: datetime) -> tuple[DataFrame, datetime]:
+        """Fetch the native funding input and preserve the exchange's entry cutoff."""
         if self.funding_fee_cutoff(open_date):
             # Shift back to 1h candle to avoid missing funding fees
             # Only really relevant for trades very close to the full hour
@@ -3908,8 +3919,6 @@ class Exchange:
         timeframe_ff = self._ft_has["funding_fee_timeframe"]
         mark_price_type = CandleType.from_string(self._ft_has["mark_ohlcv_price"])
 
-        if not close_date:
-            close_date = datetime.now(UTC)
         since_ms = dt_ts(timeframe_to_prev_date(timeframe, open_date))
 
         mark_comb: PairWithTimeframe = (pair, timeframe, mark_price_type)
@@ -3928,15 +3937,7 @@ class Exchange:
         except KeyError:
             raise ExchangeError("Could not find funding rates.") from None
 
-        funding_mark_rates = self.combine_funding_and_mark(funding_rates, mark_rates)
-
-        return self.calculate_funding_fees(
-            funding_mark_rates,
-            amount=amount,
-            is_short=is_short,
-            open_date=open_date,
-            close_date=close_date,
-        )
+        return self.combine_funding_and_mark(funding_rates, mark_rates), open_date
 
     @staticmethod
     def combine_funding_and_mark(
@@ -3979,6 +3980,51 @@ class Exchange:
                     combined.loc[is_leading_na, "open_fund"] = futures_funding_rate
                 return combined[relevant_cols].dropna()
 
+    @staticmethod
+    def _funding_window(
+        df: DataFrame, open_date: datetime, close_date: datetime, after: datetime | None = None
+    ) -> DataFrame:
+        if df.empty:
+            return df
+        dates = df["date"]
+        unit = dates.dtype.unit
+        lo = Timestamp(open_date).ceil(unit).as_unit(unit)
+        hi = Timestamp(close_date).floor(unit).as_unit(unit)
+        left = dates.searchsorted(lo, "left")
+        if after is not None:
+            left = max(left, dates.searchsorted(Timestamp(after).as_unit(unit), "right"))
+        return df.iloc[left : dates.searchsorted(hi, "right")]
+
+    def calculate_funding_payments(
+        self,
+        df: DataFrame,
+        amount: float,
+        is_short: bool,
+        open_date: datetime,
+        close_date: datetime,
+        after: datetime | None,
+    ) -> list[tuple[datetime, float]]:
+        """Keep individual discrete settlements for cash/margin allocation and restart catch-up."""
+        if not amount:
+            return []
+        window = self._funding_window(df, open_date, close_date, after)
+        if window.empty:
+            return []
+        if (
+            not all(isfinite(value) for value in window[["open_fund", "open_mark"]].to_numpy().flat)
+            or (window["open_mark"] <= 0).any()
+        ):
+            raise OperationalException(
+                "Isolated funding needs finite rates and positive finite marks."
+            )
+        return [
+            (
+                date.to_pydatetime(),
+                self.calculate_funding_fees(group, amount, is_short, date, date),
+            )
+            for date, group in window.groupby("date", sort=True)
+        ]
+
     def calculate_funding_fees(
         self,
         df: DataFrame,
@@ -3999,14 +4045,7 @@ class Exchange:
         fees: float = 0
 
         if not df.empty:
-            dates = df["date"]
-            unit = dates.dtype.unit
-            # Timestamps must be converted to column unit for dry/live mode
-            # where open/close dates can have microsecond precision - but the column may not have
-            # that precision.
-            lo = Timestamp(open_date).ceil(unit).as_unit(unit)
-            hi = Timestamp(close_date).floor(unit).as_unit(unit)
-            df1 = df.iloc[dates.searchsorted(lo, "left") : dates.searchsorted(hi, "right")]
+            df1 = self._funding_window(df, open_date, close_date)
             fees = sum(df1["open_fund"] * df1["open_mark"] * amount)
         if isnan(fees):
             fees = 0.0

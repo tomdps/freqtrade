@@ -123,6 +123,37 @@ Possible values are any floats between 0.0 and 0.99
 !!! Danger "A `liquidation_buffer` of 0.0, or a low `liquidation_buffer` is likely to result in liquidations, and liquidation fees"
     Currently Freqtrade is able to calculate liquidation prices, but does not calculate liquidation fees. Setting your `liquidation_buffer` to 0.0, or using a low `liquidation_buffer` could result in your positions being liquidated. Freqtrade does not track liquidation fees, so liquidations will result in inaccurate profit/loss results for your bot. If you use a low `liquidation_buffer`, it is recommended to use `stoploss_on_exchange` if your exchange supports this.
 
+### Funding and isolated collateral in simulations
+
+In the continuously refreshed funding mode (`funding_fee_continuous`), Binance simulations
+allocate funding using Binance's [cash-first rule](https://www.binance.com/en/support/faq/detail/360033525031):
+a funding debit uses available futures cash, then the paying position's isolated margin.
+A credit adds available cash; it does not restore margin previously spent on funding.
+The native `funding_fee_cash_first` exchange capability selects this rule.
+Other exchanges and cross margin keep their existing accounting.
+
+The simulated wallet books paid entry fees immediately. Its `used` balance is the remaining
+isolated collateral, `free` is spendable cash, and `total = free + used` excludes unrealized
+price profit and loss. Position value adds that profit or loss to the remaining collateral;
+funding is not counted a second time. Exit fees are booked at an actual exit.
+The liquidation price is recalculated when funding consumes margin, before the next exit check.
+In live trading, the continuously refreshed route reads the exchange's liquidation price;
+it does not substitute simulated collateral for the exchange's balance.
+
+This simulated allocation supports a single initial entry and a full exit. Position adjustments
+are refused. Funding payments observed together are allocated in trade opening order, then trade
+ID and pair order. This is a deterministic simulation convention, not evidence of an exchange's
+ordering of simultaneous settlements. Individual settlements are read from the native funding
+history and replayed chronologically, including when a restart spans several payments. A changed
+net total without its individual settlements is refused.
+
+The amount already processed, last settlement time and margin already spent are stored with the
+trade, so repeated polls and restarts do not apply a payment twice. Older simulated open trades have no such history
+and cannot be resumed under this rule; start a new simulation. No existing bot is upgraded
+automatically. Complete funding and mark data are still required. A paper simulation cannot
+reconstruct a historical liquidation's execution while it was offline. Candle timing, mark/last-price
+differences, liquidation fees and insurance-fund treatment remain simulation limitations.
+
 ## Unavailable funding rates
 
 For futures data, exchanges commonly provide the futures candles, the marks, and the funding rates. However, it is common that whilst candles and marks might be available, the funding rates are not. This can affect backtesting timeranges, i.e. you may only be able to test recent timeranges and not earlier, experiencing the `No data found. Terminating.` error. To get around this, add the `futures_funding_rate` config option as listed in [configuration.md](configuration.md), and it is recommended that you set this to `0`, unless you know a given specific funding rate for your pair, exchange and timerange. Setting this to anything other than `0` can have drastic effects on your profit calculations within strategy, e.g. within the `custom_exit`, `custom_stoploss`, etc functions.

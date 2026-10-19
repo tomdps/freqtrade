@@ -54,6 +54,171 @@ def trim_dictlist(dict_list, num):
     return new
 
 
+@pytest.mark.parametrize("is_short", [False, True], ids=["long", "short"])
+@pytest.mark.parametrize(
+    "free_cash,funding,fee,exit_minute,entry_minute",
+    [
+        pytest.param(100, 200, 0, None, -5, id="credit"),
+        pytest.param(500, -200, 0, None, -5, id="cash-funded-debit"),
+        pytest.param(100, -200, 0, None, -5, id="margin-funded-debit"),
+        pytest.param(100, -1095, 0, None, -5, id="maintenance-breach"),
+        pytest.param(100, -200, 0.001, 0, -5, id="fee-full-exit-at-payment"),
+        pytest.param(100, -200, 0.001, 1, -5, id="fee-full-exit-after-payment"),
+        pytest.param(100, -200, 0.001, None, 0, id="entry-at-payment"),
+        pytest.param(100, -200, 0.001, None, 1, id="entry-after-payment"),
+    ],
+)
+def test_isolated_funding_updates_collateral_at_settlement(
+    mocker, default_conf_usdt, is_short, free_cash, funding, fee, exit_minute, entry_minute
+):
+    """Funding uses available cash before isolated margin, without inventing collateral."""
+    from decimal import Decimal
+
+    pair = "COIN/USDT:USDT"
+    config = default_conf_usdt
+    config.update(
+        runmode=RunMode.BACKTEST,
+        trading_mode="futures",
+        margin_mode="isolated",
+        candle_type_def=CandleType.FUTURES,
+        timeframe="5m",
+        timeframe_detail="1m",
+        startup_candle_count=0,
+        stake_amount=1000,
+        dry_run_wallet=1000 + free_cash,
+        tradable_balance_ratio=1,
+        max_open_trades=1,
+        minimal_roi={"0": 100},
+        stoploss=-0.99,
+        liquidation_buffer=0,
+        fee=fee,
+    )
+    config["exchange"] = {
+        "name": "binance",
+        "enable_ws": False,
+        "pair_whitelist": [pair],
+        "pair_blacklist": [],
+        "_ft_has_params": {"funding_fee_continuous": True},
+    }
+    market = {
+        "id": "COINUSDT",
+        "symbol": pair,
+        "base": "COIN",
+        "quote": "USDT",
+        "settle": "USDT",
+        "active": True,
+        "swap": True,
+        "linear": True,
+        "inverse": False,
+        "type": "swap",
+        "contractSize": 1,
+        "precision": {"amount": 8, "price": 8},
+    }
+    patch_exchange(mocker, exchange="binance", mock_markets={pair: market})
+    mocker.patch(f"{EXMS}.get_min_pair_stake_amount", return_value=1)
+    mocker.patch(f"{EXMS}.get_max_pair_stake_amount", return_value=float("inf"))
+    mocker.patch(f"{EXMS}.get_max_leverage", return_value=1)
+    mocker.patch(f"{EXMS}.get_maintenance_ratio_and_amt", return_value=(0.01, 0))
+    backtesting = Backtesting(config)
+    strategy = backtesting.strategylist[0]
+    strategy.can_short = True
+    backtesting._set_strategy(strategy)
+    settlement = pd.Timestamp("2024-01-01 08:00", tz="UTC")
+    observed_at = settlement + timedelta(minutes=max(0, entry_minute))
+    side = "short" if is_short else "long"
+    strategy.populate_entry_trend = lambda frame, metadata: frame.assign(
+        **{
+            f"enter_{side}": (
+                frame.date == settlement + timedelta(minutes=min(0, entry_minute) - 5)
+            ).astype(int)
+        }
+    )
+    strategy.populate_exit_trend = lambda frame, metadata: frame
+    strategy.custom_entry_price = lambda **kwargs: 100.0
+    observed = {}
+
+    def observe(current_time, **kwargs):
+        if current_time == observed_at and LocalTrade.bt_trades_open and not observed:
+            trade = LocalTrade.bt_trades_open[0]
+            if not trade.amount:
+                return
+            observed.update(
+                funding=trade.funding_fees,
+                free=backtesting.wallets.get_free("USDT"),
+                liquidation=trade.liquidation_price,
+                collateral=backtesting.wallets.get_all_positions()[pair].collateral,
+                position_value=backtesting.wallets.get_all_positions()[pair].estimate_value(110),
+                total=backtesting.wallets.get_total("USDT"),
+            )
+
+    strategy.bot_loop_start = observe
+
+    def custom_exit(current_time, **kwargs):
+        observe(current_time)
+        if exit_minute is not None and current_time == settlement + timedelta(minutes=exit_minute):
+            return "scheduled_exit"
+
+    strategy.custom_exit = custom_exit
+    dates = pd.date_range(
+        settlement - timedelta(minutes=15), settlement + timedelta(minutes=10), freq="1min"
+    )
+    candles = pd.DataFrame(
+        {
+            "date": dates,
+            "open": 100.0,
+            "high": 100.0,
+            "low": 100.0,
+            "close": 100.0,
+            "volume": 1000.0,
+        }
+    )
+    if entry_minute == 1:
+        candles.loc[candles.date == settlement, ["open", "high", "low", "close"]] = (
+            99.0 if is_short else 101.0
+        )
+    backtesting.detail_data[pair] = candles.copy()
+    backtesting.futures_data[pair] = pd.DataFrame(
+        {
+            "date": [settlement],
+            "open_mark": [100.0],
+            "open_fund": [funding / 1000 * (1 if is_short else -1)],
+        }
+    )
+    result = backtesting.backtest(
+        processed={pair: candles.iloc[::5].copy()},
+        start_date=dates[0],
+        end_date=dates[-1],
+    )
+    funding = funding if entry_minute <= 0 else 0
+    entry_fee = Decimal(1000) * Decimal(str(fee))
+    remaining_cash = Decimal(free_cash + funding) - entry_fee
+    collateral = Decimal(1000) + min(Decimal(0), remaining_cash)
+    expected_price = (
+        (Decimal(1000) + collateral) / Decimal("10.1")
+        if is_short
+        else (Decimal(1000) - collateral) / Decimal("9.9")
+    )
+    assert observed["funding"] == pytest.approx(funding)
+    assert observed["free"] == pytest.approx(float(max(Decimal(0), remaining_cash)))
+    assert observed["liquidation"] == pytest.approx(float(expected_price))
+    assert observed["collateral"] == pytest.approx(float(collateral))
+    assert observed["position_value"] == pytest.approx(
+        float(collateral) + (-100 if is_short else 100)
+    )
+    assert observed["total"] == pytest.approx(1000 + free_cash + funding - float(entry_fee))
+    trade = LocalTrade.bt_trades[0]
+    assert trade.orders[0].order_filled_utc == settlement + timedelta(minutes=entry_minute)
+    if collateral < Decimal(10):
+        assert trade.exit_reason == "liquidation"
+        assert trade.close_date_utc == settlement
+    elif exit_minute is not None:
+        assert trade.close_date_utc == settlement + timedelta(minutes=exit_minute)
+    assert result["results"].iloc[0]["funding_fees"] == pytest.approx(funding)
+    assert result["final_balance"] == pytest.approx(
+        1000 + free_cash + funding - 2 * float(entry_fee)
+    )
+
+
 def load_data_test(what, testdatadir):
     timerange = TimeRange.parse_timerange("1510694220-1510700340")
     data = history.load_pair_history(

@@ -16,6 +16,7 @@ from freqtrade.persistence.base import ModelBase
 from freqtrade.persistence.migrations import get_last_sequence_ids, set_sequence_ids
 from freqtrade.persistence.models import PairLock
 from freqtrade.persistence.trade_model import Order
+from freqtrade.util import dt_utc
 from tests.conftest import log_has
 
 
@@ -49,6 +50,42 @@ def test_init_invalid_db_url():
 
     with pytest.raises(OperationalException, match=r"Bad db-url.*For in-memory database, pl.*"):
         init_db("sqlite:///")
+
+
+def test_migrate_isolated_funding_state(tmp_path):
+    """Old trades retain their money values, but missing margin history is explicitly unknown."""
+    db_url = f"sqlite:///{tmp_path / 'funding.sqlite'}"
+    init_db(db_url)
+    trade = Trade(
+        pair="COIN/USDT:USDT",
+        exchange="binance",
+        trading_mode=TradingMode.FUTURES,
+        amount=10,
+        stake_amount=1000,
+        open_rate=100,
+        open_date=dt_utc(2024, 1, 1),
+        fee_open=0.001,
+        fee_close=0.001,
+        funding_fees=-150,
+        funding_fee_running=-150,
+        funding_fee_processed=-150,
+        funding_fee_margin=-50,
+    )
+    Trade.session.add(trade)
+    Trade.commit()
+    Trade.session.execute(text("ALTER TABLE trades DROP COLUMN funding_fee_processed"))
+    Trade.session.execute(text("ALTER TABLE trades DROP COLUMN funding_fee_margin"))
+    Trade.session.execute(text("ALTER TABLE trades DROP COLUMN funding_fee_last_time"))
+    Trade.commit()
+    Trade.session.remove()
+    init_db(db_url)
+    restored = Trade.get_open_trades()[0]
+    assert restored.amount == 10
+    assert restored.stake_amount == 1000
+    assert restored.funding_fees_since_last_exit == -150
+    assert restored.funding_fee_processed is None
+    assert restored.funding_fee_margin is None
+    assert restored.funding_fee_last_time is None
 
 
 def test_init_prod_db(default_conf, mocker):

@@ -1010,7 +1010,13 @@ class Backtesting:
                     return t
         return None
 
-    def _run_funding_fees(self, trade: LocalTrade, current_time: datetime, force: bool = False):
+    def _run_funding_fees(
+        self,
+        trade: LocalTrade,
+        current_time: datetime,
+        force: bool = False,
+        defer_wallet: bool = False,
+    ):
         """
         Calculate funding fees if necessary and add them to the trade.
         """
@@ -1030,6 +1036,17 @@ class Backtesting:
                         close_date=current_time,
                     )
                 )
+                if self.wallets.uses_isolated_funding:
+                    trade._funding_fee_payments = self.exchange.calculate_funding_payments(
+                        self.futures_data[trade.pair],
+                        trade.amount,
+                        trade.is_short,
+                        trade.date_last_filled_utc,
+                        current_time,
+                        trade.funding_fee_last_time_utc,
+                    )
+                    if not defer_wallet and trade._funding_fee_payments:
+                        self.wallets.update()
 
     def get_valid_entry_price_and_stake(
         self,
@@ -1659,7 +1676,7 @@ class Backtesting:
         if self.exchange.get_option("funding_fee_continuous", False) is True:
             if LocalTrade.bt_trades_open:  # otherwise nothing accrues and the wallet is current
                 for trade in LocalTrade.bt_trades_open:
-                    self._run_funding_fees(trade, current_time)
+                    self._run_funding_fees(trade, current_time, defer_wallet=True)
                 self.wallets.update()
             if capture:
                 self._capture_wallet(current_time, self.strategy.config["stake_currency"], 1)

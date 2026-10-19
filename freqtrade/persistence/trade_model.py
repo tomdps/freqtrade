@@ -466,6 +466,12 @@ class LocalTrade:
     # Used to keep running funding fees - between the last filled order and now
     # Shall not be used for calculations!
     funding_fee_running: float | None = None
+    # Simulated isolated funding already allocated between cash and position margin.
+    funding_fee_processed: float | None = 0.0
+    funding_fee_margin: float | None = 0.0
+    funding_fee_last_time: datetime | None = None
+    # Recreated from native funding history; only the processed cursor and margin are persisted.
+    _funding_fee_payments: list[tuple[datetime, float]] | None = None
     # v 2 -> correct max_stake_amount calculation for leveraged trades
     record_version: int = 2
 
@@ -776,6 +782,10 @@ class LocalTrade:
             "is_short": self.is_short,
             "trading_mode": self.trading_mode,
             "funding_fees": self.funding_fees,
+            "funding_fee_running": self.funding_fee_running,
+            "funding_fee_processed": self.funding_fee_processed,
+            "funding_fee_margin": self.funding_fee_margin,
+            "funding_fee_last_timestamp": dt_ts_none(self.funding_fee_last_time_utc),
             "amount_precision": self.amount_precision,
             "price_precision": self.price_precision,
             "precision_mode": self.precision_mode,
@@ -825,6 +835,17 @@ class LocalTrade:
         self.funding_fee_running = funding_fee
         prior_funding_fees = sum([o.funding_fee for o in self.orders if o.funding_fee])
         self.funding_fees = prior_funding_fees + funding_fee
+
+    @property
+    def isolated_collateral(self) -> float:
+        """Initial margin less funding paid from that margin, without changing exposure."""
+        return self.stake_amount + (self.funding_fee_margin or 0.0)
+
+    @property
+    def funding_fee_last_time_utc(self) -> datetime | None:
+        return (
+            self.funding_fee_last_time.replace(tzinfo=UTC) if self.funding_fee_last_time else None
+        )
 
     @property
     def funding_fees_since_last_exit(self) -> float:
@@ -1691,6 +1712,14 @@ class LocalTrade:
             is_short=data["is_short"],
             trading_mode=data.get("trading_mode"),
             funding_fees=data.get("funding_fees"),
+            funding_fee_running=data.get("funding_fee_running"),
+            funding_fee_processed=data.get("funding_fee_processed"),
+            funding_fee_margin=data.get("funding_fee_margin"),
+            funding_fee_last_time=(
+                dt_from_ts(data["funding_fee_last_timestamp"])
+                if data.get("funding_fee_last_timestamp") is not None
+                else None
+            ),
             amount_precision=data.get("amount_precision", None),
             price_precision=data.get("price_precision", None),
             precision_mode=data.get("precision_mode", None),
@@ -1823,11 +1852,16 @@ class Trade(ModelBase, LocalTrade):
     # Futures properties
     funding_fees: Mapped[float | None] = mapped_column(Float(), nullable=True, default=None)
     funding_fee_running: Mapped[float | None] = mapped_column(Float(), nullable=True, default=None)
+    funding_fee_processed: Mapped[float | None] = mapped_column(Float(), nullable=True, default=0.0)
+    funding_fee_margin: Mapped[float | None] = mapped_column(Float(), nullable=True, default=0.0)
+    funding_fee_last_time: Mapped[datetime | None] = mapped_column(nullable=True)
 
     record_version: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
 
     def __init__(self, **kwargs):
         from_json = kwargs.pop("__FROM_JSON", None)
+        kwargs.setdefault("funding_fee_processed", 0.0)
+        kwargs.setdefault("funding_fee_margin", 0.0)
         super().__init__(**kwargs)
         if not from_json:
             # Skip recalculation when loading from json

@@ -153,6 +153,10 @@ def migrate_trades_and_orders_table(
     interest_rate = get_column_def(cols, "interest_rate", "0.0")
     funding_fees = get_column_def(cols, "funding_fees", "0.0")
     funding_fee_running = get_column_def(cols, "funding_fee_running", "null")
+    # Old simulations did not record the cash/margin funding allocation.
+    funding_fee_processed = get_column_def(cols, "funding_fee_processed", "null")
+    funding_fee_margin = get_column_def(cols, "funding_fee_margin", "null")
+    funding_fee_last_time = get_column_def(cols, "funding_fee_last_time", "null")
     max_stake_amount = get_column_def(cols, "max_stake_amount", "stake_amount")
     record_version = get_column_def(cols, "record_version", "1")
 
@@ -211,6 +215,7 @@ def migrate_trades_and_orders_table(
             timeframe, open_trade_value, close_profit_abs,
             trading_mode, leverage, liquidation_price, is_short,
             interest_rate, funding_fees, funding_fee_running, realized_profit,
+            funding_fee_processed, funding_fee_margin, funding_fee_last_time,
             amount_precision, price_precision, precision_mode, precision_mode_price, contract_size,
             max_stake_amount, record_version
             )
@@ -240,6 +245,8 @@ def migrate_trades_and_orders_table(
             {is_short} is_short, {interest_rate} interest_rate,
             {funding_fees} funding_fees, {funding_fee_running} funding_fee_running,
             {realized_profit} realized_profit,
+            {funding_fee_processed} funding_fee_processed, {funding_fee_margin} funding_fee_margin,
+            {funding_fee_last_time} funding_fee_last_time,
             {amount_precision} amount_precision, {price_precision} price_precision,
             {precision_mode} precision_mode, {precision_mode_price} precision_mode_price,
             {contract_size} contract_size, {max_stake_amount} max_stake_amount,
@@ -433,7 +440,7 @@ def check_migrate(engine: Engine, decl_base, previous_tables: list[str]) -> None
     # if ('orders' not in previous_tables
     # or not has_column(cols_orders, 'funding_fee')):
     migrating = False
-    if not has_column(cols_trades, "record_version"):
+    if not has_column(cols_trades, "funding_fee_last_time"):
         # if not has_column(cols_orders, "ft_order_tag"):
         migrating = True
         logger.info(

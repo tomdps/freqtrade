@@ -46,4 +46,6 @@ jobs:
             tests/optimize/test_backtesting.py tests/optimize/test_backtesting_adjust_position.py \
             tests/optimize/test_kraken_funding_backtest.py \
             tests/freqtradebot \
-            tests/test_wallets.py tests/test_candle_columns.py tests/persistence/test_persistence.py
+            tests/test_wallets.py tests/test_candle_columns.py tests/persistence/test_persistence.py \
+            tests/persistence/test_migrations.py tests/persistence/test_trade_fromjson.py \
+            tests/rpc/test_rpc.py::test_rpc_trade_status tests/rpc/test_rpc.py::test_rpc_balance_futures

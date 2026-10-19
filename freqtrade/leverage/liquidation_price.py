@@ -1,10 +1,14 @@
 import logging
+from typing import TYPE_CHECKING
 
 from freqtrade.enums import MarginMode
 from freqtrade.exceptions import DependencyException
 from freqtrade.exchange import Exchange
 from freqtrade.persistence import LocalTrade, Trade
-from freqtrade.wallets import Wallets
+
+
+if TYPE_CHECKING:
+    from freqtrade.wallets import Wallets
 
 
 logger = logging.getLogger(__name__)
@@ -14,7 +18,7 @@ def update_liquidation_prices(
     trade: LocalTrade | None = None,
     *,
     exchange: Exchange,
-    wallets: Wallets,
+    wallets: "Wallets",
     stake_currency: str,
     dry_run: bool = False,
 ):
@@ -58,7 +62,7 @@ def update_liquidation_prices(
                     amount=trade.amount,
                     stake_amount=trade.stake_amount,
                     leverage=trade.leverage,
-                    wallet_balance=trade.stake_amount,
+                    wallet_balance=trade.isolated_collateral if dry_run else trade.stake_amount,
                 )
             )
         else:

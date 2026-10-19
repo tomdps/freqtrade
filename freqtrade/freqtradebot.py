@@ -444,8 +444,9 @@ class FreqtradeBot(LoggingMixin):
         except TemporaryError as e:
             logger.warning(f"Funding of trade {trade.id} not updated, will retry: {e}")
             return False
-        funding_changed = funding != trade.funding_fees
+        previous_funding = trade.funding_fees
         trade.set_funding_fees(funding)
+        funding_changed = trade.funding_fees != previous_funding
         if update_wallet:
             self.wallets.update()
         if (

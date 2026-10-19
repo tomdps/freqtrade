@@ -2279,6 +2279,8 @@ def test_Trade_object_idem():
         "bt_open_open_trade_count",
         "bt_total_profit",
         "from_json",
+        # Transient funding input is inherited; only its allocation state is persisted.
+        "_funding_fee_payments",
     )
 
     # Parent (LocalTrade) should have the same attributes

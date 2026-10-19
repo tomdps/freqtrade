@@ -20,6 +20,7 @@ from freqtrade.data.btanalysis import (
 )
 from freqtrade.enums import ExitType
 from freqtrade.optimize.optimize_reports import (
+    convert_bt_wallet_collection,
     generate_backtest_stats,
     generate_daily_stats,
     generate_pair_metrics,
@@ -623,7 +624,8 @@ def test_text_table_strategy(testdatadir, capsys):
     )
 
 
-def test_generate_wallet_stats_extended_metrics():
+@pytest.mark.parametrize("repeated_snapshots", [False, True])
+def test_generate_wallet_stats_extended_metrics(repeated_snapshots):
     wallet_df = pd.DataFrame(
         {
             "date": [
@@ -638,7 +640,35 @@ def test_generate_wallet_stats_extended_metrics():
         }
     )
 
+    if repeated_snapshots:
+        dates = wallet_df["date"].tolist()
+        wallet_df = convert_bt_wallet_collection(
+            [
+                (dates[0], "BTC", 1.0, 90.0),
+                (dates[0], "ALT", 1.0, 20.0),
+                (dates[0], "BTC", 1.0, 80.0),
+                (dates[0], "ALT", 2.0, 10.0),
+                (dates[1], "BTC", 1.0, 100.0),
+                (dates[1], "ALT", 2.0, 3.0),
+                (dates[1], "BTC", 1.0, 120.0),
+                (dates[1], "ALT", 4.0, 0.0),
+                (dates[2], "BTC", 1.0, 40.0),
+                (dates[2], "BTC", 1.0, 60.0),
+                (dates[2], "ALT", 1.0, 20.0),
+                (dates[3], "BTC", 1.0, 70.0),
+                (dates[3], "ALT", 1.0, 10.0),
+                (dates[3], "BTC", 1.0, 100.0),
+            ]
+        )
+    original = wallet_df.copy(deep=True)
     stats = generate_wallet_stats(wallet_df, "BTC")
+
+    # Last per-currency captures give 80+20, 120+0, 60+20 and 100+10.
+    assert stats["start_balance"] == 100.0
+    assert stats["end_balance"] == 110.0
+    assert stats["high_balance"] == 120.0
+    assert stats["low_balance"] == 80.0
+    assert stats["max_drawdown_abs"] == 40.0
 
     assert "sharpe" in stats
     assert "sortino" in stats
@@ -648,6 +678,29 @@ def test_generate_wallet_stats_extended_metrics():
     assert pytest.approx(stats["max_drawdown_account"]) == 1 / 3
     assert stats["drawdown_start"] == "2025-01-01 12:00:00"
     assert stats["drawdown_end"] == "2025-01-01 18:00:00"
+
+    pd.testing.assert_frame_equal(wallet_df, original)
+
+
+@pytest.mark.parametrize("kind", ["none", "empty", "empty-schema", "single-zero"])
+def test_generate_wallet_stats_empty_and_zero(kind):
+    wallet_df = None
+    if kind == "empty":
+        wallet_df = pd.DataFrame()
+    elif kind == "empty-schema":
+        wallet_df = pd.DataFrame(columns=["date", "currency", "rate", "balance"])
+    elif kind == "single-zero":
+        wallet_df = convert_bt_wallet_collection([(dt_utc(2025, 1, 1), "BTC", 1.0, 0.0)])
+    original = wallet_df.copy(deep=True) if wallet_df is not None else None
+    stats = generate_wallet_stats(wallet_df, "BTC")
+    if kind == "single-zero":
+        for key in ("start_balance", "end_balance", "high_balance", "low_balance"):
+            assert stats[key] == 0.0
+        assert stats["max_drawdown_abs"] == 0.0
+    else:
+        assert stats == {}
+    if wallet_df is not None:
+        pd.testing.assert_frame_equal(wallet_df, original)
 
 
 def test_text_table_add_metrics_shows_wallet_ratios(testdatadir, capsys):

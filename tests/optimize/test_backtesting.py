@@ -25,7 +25,7 @@ from freqtrade.exchange import timeframe_to_next_date, timeframe_to_prev_date
 from freqtrade.exchange.exchange_utils import DECIMAL_PLACES, TICK_SIZE
 from freqtrade.optimize.backtest_caching import get_backtest_metadata_filename, get_strategy_run_id
 from freqtrade.optimize.backtesting import DATE_IDX, HEADERS, Backtesting
-from freqtrade.persistence import LocalTrade, Trade
+from freqtrade.persistence import LocalTrade, Order, Trade
 from freqtrade.resolvers import StrategyResolver
 from freqtrade.util import dt_now, dt_utc
 from tests.conftest import (
@@ -54,37 +54,7 @@ def trim_dictlist(dict_list, num):
     return new
 
 
-@pytest.mark.parametrize("is_short", [False, True], ids=["long", "short"])
-@pytest.mark.parametrize(
-    "free_cash,funding,fee,exit_minute,entry_minute,price_path",
-    [
-        pytest.param(100, 200, 0, None, -5, None, id="credit"),
-        pytest.param(500, -200, 0, None, -5, None, id="cash-funded-debit"),
-        pytest.param(100, -200, 0, None, -5, None, id="margin-funded-debit"),
-        pytest.param(100, -1095, 0, None, -5, None, id="maintenance-breach"),
-        pytest.param(100, -200, 0.001, 0, -5, None, id="fee-full-exit-at-payment"),
-        pytest.param(100, -200, 0.001, 1, -5, None, id="fee-full-exit-after-payment"),
-        pytest.param(100, -200, 0.001, None, 0, None, id="entry-at-payment"),
-        pytest.param(100, -200, 0.001, None, 1, None, id="entry-after-payment"),
-        pytest.param(1, -1500, 0.001, None, -5, "credit", id="negative-wallet-credit"),
-        pytest.param(1, -1500, 0.001, None, -5, "retrace", id="negative-wallet-liquidation"),
-        pytest.param(1, -1500, 0.001, None, -5, "terminal-retrace", id="terminal-liquidation"),
-    ],
-)
-def test_isolated_funding_updates_collateral_at_settlement(
-    mocker,
-    default_conf_usdt,
-    is_short,
-    free_cash,
-    funding,
-    fee,
-    exit_minute,
-    entry_minute,
-    price_path,
-):
-    """Funding uses available cash before isolated margin, without inventing collateral."""
-    from decimal import Decimal
-
+def _isolated_funding_backtest(mocker, default_conf_usdt, free_cash=100, fee=0):
     pair = "COIN/USDT:USDT"
     config = default_conf_usdt
     config.update(
@@ -134,6 +104,43 @@ def test_isolated_funding_updates_collateral_at_settlement(
     strategy = backtesting.strategylist[0]
     strategy.can_short = True
     backtesting._set_strategy(strategy)
+    return pair, backtesting
+
+
+@pytest.mark.parametrize("is_short", [False, True], ids=["long", "short"])
+@pytest.mark.parametrize(
+    "free_cash,funding,fee,exit_minute,entry_minute,price_path",
+    [
+        pytest.param(100, 200, 0, None, -5, None, id="credit"),
+        pytest.param(500, -200, 0, None, -5, None, id="cash-funded-debit"),
+        pytest.param(100, -200, 0, None, -5, None, id="margin-funded-debit"),
+        pytest.param(100, -1095, 0, None, -5, None, id="maintenance-breach"),
+        pytest.param(100, -200, 0.001, 0, -5, None, id="fee-full-exit-at-payment"),
+        pytest.param(100, -200, 0.001, 1, -5, None, id="fee-full-exit-after-payment"),
+        pytest.param(100, -200, 0.001, None, 0, None, id="entry-at-payment"),
+        pytest.param(100, -200, 0.001, None, 1, None, id="entry-after-payment"),
+        pytest.param(1, -1500, 0.001, None, -5, "credit", id="negative-wallet-credit"),
+        pytest.param(1, -1500, 0.001, None, -5, "retrace", id="negative-wallet-liquidation"),
+        pytest.param(1, -1500, 0.001, None, -5, "terminal-retrace", id="terminal-liquidation"),
+    ],
+)
+def test_isolated_funding_updates_collateral_at_settlement(
+    mocker,
+    default_conf_usdt,
+    is_short,
+    free_cash,
+    funding,
+    fee,
+    exit_minute,
+    entry_minute,
+    price_path,
+):
+    """Funding uses available cash before isolated margin, without inventing collateral."""
+    from decimal import Decimal
+
+    pair, backtesting = _isolated_funding_backtest(mocker, default_conf_usdt, free_cash, fee)
+    strategy = backtesting.strategy
+    fees = mocker.spy(backtesting.exchange, "calculate_funding_fees")
     settlement = pd.Timestamp("2024-01-01 08:00", tz="UTC")
     credit_at = settlement + timedelta(hours=8)
     observed_at = settlement + timedelta(minutes=max(0, entry_minute))
@@ -256,6 +263,8 @@ def test_isolated_funding_updates_collateral_at_settlement(
         close_price = expected_price
         assert trade.close_rate == pytest.approx(float(close_price))
     elif price_path == "credit":
+        # Two known settlements in an eight-hour hold must not trigger minute-by-minute sums.
+        assert fees.call_count < 20
         assert credited["funding"] == pytest.approx(funding + 2000)
         assert credited["free"] == pytest.approx(2000)
         assert credited["available"] == pytest.approx(2000)
@@ -276,6 +285,107 @@ def test_isolated_funding_updates_collateral_at_settlement(
     assert result["final_balance"] == pytest.approx(
         float(Decimal(1000 + free_cash + funding) + expected_pnl - entry_fee - close_fee)
     )
+
+
+@pytest.mark.parametrize("unit", ["s", "ms", "us", "ns"])
+def test_discrete_funding_idle_checks_keep_native_boundaries(mocker, default_conf_usdt, unit):
+    pair, backtesting = _isolated_funding_backtest(mocker, default_conf_usdt)
+    backtesting.reset_backtest()
+    start = pd.Timestamp("2024-01-01 08:00", tz="UTC")
+    if unit == "ns":
+        start += pd.Timedelta(1, "ns")
+    dates = pd.DatetimeIndex(
+        [start, start + timedelta(hours=1), start + timedelta(hours=2)]
+    ).as_unit(unit)
+    frame = pd.DataFrame({"date": dates, "open_mark": 100.0, "open_fund": [0.01, 0.0, -0.02]})
+    backtesting.futures_data[pair] = frame
+    opened = start.to_pydatetime(warn=False) - timedelta(minutes=5)
+    trade = LocalTrade(
+        pair=pair,
+        stake_amount=1000,
+        amount=10,
+        open_rate=100,
+        open_date=opened,
+        fee_open=0,
+        fee_close=0,
+        is_open=True,
+        is_short=False,
+        leverage=1,
+        trading_mode="futures",
+    )
+    entry = Order(
+        order_id="entry",
+        ft_pair=pair,
+        ft_order_side="buy",
+        ft_amount=10,
+        ft_price=100,
+        amount=10,
+        filled=10,
+        price=100,
+        status="closed",
+        ft_is_open=False,
+        order_date=opened,
+        order_filled_date=opened,
+        funding_fee=0,
+    )
+    trade.orders = [entry]
+    LocalTrade.add_bt_trade(trade)
+    backtesting.wallets.update()
+    backtesting._run_funding_fees(trade, start - timedelta(microseconds=1))
+    assert trade.funding_fees == 0
+    backtesting._run_funding_fees(trade, start, defer_wallet=True)
+    pending = trade._funding_fee_payments.copy()
+    backtesting._run_funding_fees(trade, start + timedelta(microseconds=1), defer_wallet=True)
+    assert trade._funding_fee_payments == pending
+    assert backtesting.wallets.get_free("USDT") == 100
+    backtesting._run_funding_fees(trade, start + timedelta(microseconds=2))
+    assert backtesting.wallets.get_free("USDT") == 90
+    assert trade.funding_fees == -10
+    backtesting._run_funding_fees(trade, start + timedelta(minutes=1))
+    backtesting._run_funding_fees(trade, dates[1])
+    assert trade.funding_fee_last_time_utc == dates[1].to_pydatetime(warn=False)
+    assert trade.funding_fee_processed == -10
+    assert backtesting.wallets.get_free("USDT") == 90
+    # A changed past source row must still reach the native allocation refusal.
+    frame.loc[0, "open_fund"] = 0.02
+    with pytest.raises(OperationalException, match="individual settlements"):
+        backtesting._update_continuous_funding(dates[1] + timedelta(minutes=1))
+    frame.loc[0, "open_fund"] = 0.01
+    backtesting._update_continuous_funding(dates[1] + timedelta(minutes=1))
+    revised = frame.copy()
+    revised.loc[2, "open_fund"] = -0.03
+    backtesting.futures_data[pair] = revised
+    backtesting._run_funding_fees(trade, dates[1] + timedelta(minutes=2))
+    assert trade.funding_fees == -10
+    backtesting._run_funding_fees(trade, dates[2])
+    assert trade.funding_fees == 20
+    assert backtesting.wallets.get_free("USDT") == 120
+    # Native full-fill processing carries prior funding into the filled order.
+    exit_time = dates[2].to_pydatetime() + timedelta(minutes=1)
+    exit_order = Order(
+        order_id="exit",
+        ft_pair=pair,
+        ft_order_side="sell",
+        ft_amount=10,
+        ft_price=100,
+        amount=10,
+        filled=10,
+        price=100,
+        status="closed",
+        ft_is_open=False,
+        order_date=exit_time,
+        order_filled_date=exit_time,
+        funding_fee=20,
+    )
+    trade.orders.append(exit_order)
+    trade.amount = 0
+    backtesting._run_funding_fees(trade, exit_time, force=True)
+    assert trade.funding_fee_running == 0
+    assert trade.funding_fees == 20
+    # Empty native input still follows the original no-settlement path.
+    backtesting.futures_data[pair] = pd.DataFrame()
+    backtesting._run_funding_fees(trade, exit_time + timedelta(minutes=1))
+    assert trade.funding_fees == 20
 
 
 def load_data_test(what, testdatadir):

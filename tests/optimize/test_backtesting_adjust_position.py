@@ -36,6 +36,8 @@ def test_backtest_position_adjustment(default_conf, fee, mocker, testdatadir) ->
     data = history.load_data(
         datadir=testdatadir, timeframe="5m", pairs=["UNITTEST/BTC"], timerange=timerange
     )
+    # Position-accounting fixture: offer finite volume for the full adjusted position.
+    data[pair]["volume"] = 10000.0
     backtesting.strategy.position_adjustment_enable = True
     processed = backtesting.strategy.advise_all_indicators(data)
     min_date, max_date = get_timerange(processed)
@@ -141,6 +143,7 @@ def test_backtest_position_adjustment_detailed(default_conf, fee, mocker, levera
         0,  # exit_short
         "",  # enter_tag
         "",  # exit_tag
+        1000.0,  # Base volume
     ]
     # Exit row - with slightly different values
     row_exit = [
@@ -155,6 +158,7 @@ def test_backtest_position_adjustment_detailed(default_conf, fee, mocker, levera
         0,  # exit_short
         "",  # enter_tag
         "",  # exit_tag
+        1000.0,  # Base volume
     ]
     backtesting.strategy.leverage = MagicMock(return_value=leverage)
     trade = backtesting._enter_trade(pair, row=row_enter, direction="long")

@@ -1,9 +1,9 @@
 # Kraken continuous funding
 
 This fork starts from Freqtrade 2026.8. The local package version
-`2026.8+kraken.5` identifies its funding corrections. The patch targets
-backtesting and dry-run accounting; it has not been reconciled against a live
-account ledger.
+`2026.8+kraken.6` identifies its funding and native fill corrections. The patch
+targets backtesting and dry-run accounting; it has not been reconciled against
+a live account ledger.
 
 Kraken's linear perpetual contracts accrue funding continuously. Each hourly
 rate applies from its timestamp until the next hour, and only the time actually
@@ -52,10 +52,50 @@ unchanged, and a long backtest no longer slows down quadratically. In detail
 minutes without an open trade, the backtest still records the wallet but skips
 the funding and wallet refresh, since nothing accrues.
 
+## Observed candle volume in backtests
+
+A native backtest now keeps the execution candle's unshifted volume. A full
+order fills only within that candle's observed price range and remaining traded
+base quantity, at its actual timestamp. Zero, negative, non-finite or missing
+volume cannot fill an order; neither can a missing detail minute. When detail
+candles are enabled, a main candle is not a substitute for missing detail.
+Entries and exits share the same candle capacity, and pending orders retain the
+normal timeout, cancellation and retry behavior. No partial fill or automatic
+order resizing is introduced.
+
+The input `volume` must be in base-asset units, matching native trade amounts.
+The existing exchange `ohlcv_volume_currency` declaration defaults to `base`;
+backtesting refuses a declaration of `quote`. Kraken documents its
+[spot candle volume](https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/ohlc)
+in base terms. Binance's [public-data schema](https://github.com/binance/binance-public-data#klines-1)
+distinguishes USD-M traded volume from quote volume and COIN-M contract volume
+from base volume. CCXT's Binance parser selects the base-volume column for
+inverse contracts. Imported files must already follow this base-volume contract;
+raw contract counts or quote volume must not be relabeled as base volume. This
+check cannot detect a mislabeled imported file.
+Kraken's linear contracts are sized in their
+[base currency](https://support.kraken.com/articles/4844359082772-linear-multi-collateral-derivatives-contract-specifications);
+CCXT preserves the chart's volume field, so the source contract units must match
+base units before using those candles. Mark and index candles cannot substitute
+for traded volume.
+
+Final closure uses the same fill rules in the existing final candle, after the
+normal exit and liquidation checks. A pending native exit keeps precedence over
+a new forced exit. If the position cannot close in that interval, the whole
+backtest refuses instead of inventing a close or dropping the position. The
+continuous-funding endpoint remains unchanged: no later minute or funding hour
+is read to obtain a terminal fill.
+
+Total historical traded volume is only a necessary size ceiling. It does not
+establish historical quotes, queue priority, order-book depth or a fill at every
+price within the candle. The simulation retains its existing candle-ordering
+assumptions and does not claim intraminute execution fidelity.
+
 ## Maintenance
 
-Keep changes limited to these funding/collateral corrections and their regression tests. Before adopting
-an upstream release, replay the patch in a branch, run the offline financial and
+Keep changes limited to these funding/collateral corrections, native fill checks
+and their regression tests. Before adopting an upstream release, replay the
+patch in a branch, run the offline financial and
 data tests from `.github/workflows/ci.yml`, review the exact commit and require
 passing CI. Remove the local correction when the upstream implementation passes
 the same cases. Pin consumers to a reviewed commit rather than a moving branch.

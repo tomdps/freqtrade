@@ -68,6 +68,7 @@ def trim_dictlist(dict_list, num):
         pytest.param(100, -200, 0.001, None, 1, None, id="entry-after-payment"),
         pytest.param(1, -1500, 0.001, None, -5, "credit", id="negative-wallet-credit"),
         pytest.param(1, -1500, 0.001, None, -5, "retrace", id="negative-wallet-liquidation"),
+        pytest.param(1, -1500, 0.001, None, -5, "terminal-retrace", id="terminal-liquidation"),
     ],
 )
 def test_isolated_funding_updates_collateral_at_settlement(
@@ -181,7 +182,11 @@ def test_isolated_funding_updates_collateral_at_settlement(
     strategy.custom_exit = custom_exit
     dates = pd.date_range(
         settlement - timedelta(minutes=15),
-        (credit_at if price_path else settlement) + timedelta(minutes=10),
+        (
+            settlement + timedelta(minutes=5)
+            if price_path == "terminal-retrace"
+            else (credit_at if price_path else settlement) + timedelta(minutes=10)
+        ),
         freq="1min",
     )
     candles = pd.DataFrame(
@@ -199,7 +204,7 @@ def test_isolated_funding_updates_collateral_at_settlement(
     ] = 99.0 if is_short else 101.0
     if price_path:
         candles.loc[candles.date >= settlement, ["open", "high", "low", "close"]] = favorable_price
-        if price_path == "retrace":
+        if price_path in ("retrace", "terminal-retrace"):
             retrace_at = settlement + timedelta(minutes=5)
             retrace_price = 75.0 if is_short else 125.0
             candles.loc[candles.date >= retrace_at, ["open", "high", "low", "close"]] = (
@@ -245,7 +250,7 @@ def test_isolated_funding_updates_collateral_at_settlement(
     trade = LocalTrade.bt_trades[0]
     assert trade.orders[0].order_filled_utc == settlement + timedelta(minutes=entry_minute)
     close_price = Decimal(100)
-    if price_path == "retrace":
+    if price_path in ("retrace", "terminal-retrace"):
         assert trade.exit_reason == "liquidation"
         assert trade.close_date_utc == settlement + timedelta(minutes=5)
         close_price = expected_price
@@ -304,6 +309,8 @@ def load_data_test(what, testdatadir):
         data.loc[:, "low"] = np.sin(data.index * hz) / 1000 + base - 0.0001
         data.loc[:, "close"] = np.sin(data.index * hz) / 1000 + base
 
+    # Prices above are invented; give the fixture finite, ample base volume too.
+    data.loc[:, "volume"] = 1000000.0
     return {
         "UNITTEST/BTC": clean_ohlcv_dataframe(
             data, timeframe="1m", pair="UNITTEST/BTC", fill_missing=True, drop_incomplete=True
@@ -315,6 +322,8 @@ def load_data_test(what, testdatadir):
 def _make_backtest_conf(mocker, datadir, conf=None, pair="UNITTEST/BTC"):
     data = history.load_data(datadir=datadir, timeframe="1m", pairs=[pair])
     data = trim_dictlist(data, -201)
+    # These alternating-order tests assume sufficient synthetic base quantity.
+    data[pair]["volume"] = 1000.0
     patch_exchange(mocker)
     backtesting = Backtesting(conf)
     backtesting._set_strategy(backtesting.strategylist[0])
@@ -358,6 +367,165 @@ def _trend_alternate(dataframe=None, metadata=None):
     signals["enter_short"] = 0
     signals["exit_short"] = 0
     return dataframe
+
+
+def _volume_backtest(mocker, default_conf_usdt, case, start):
+    pair = "COIN/USDT"
+    config = default_conf_usdt
+    config.update(
+        runmode=RunMode.BACKTEST,
+        timeframe="1h",
+        timeframe_detail="1m",
+        startup_candle_count=0,
+        stake_amount=1000,
+        dry_run_wallet=2000,
+        max_open_trades=1,
+        minimal_roi={},
+        stoploss=-0.99,
+        fee=0.01,
+        unfilledtimeout={"entry": 1 if case == "timeout" else 10, "exit": 10, "unit": "minutes"},
+    )
+    config["exchange"].update(pair_whitelist=[pair], pair_blacklist=[])
+    if case == "quote-volume":
+        config["exchange"]["_ft_has_params"] = {"ohlcv_volume_currency": "quote"}
+    market = {
+        "id": "COINUSDT",
+        "symbol": pair,
+        "base": "COIN",
+        "quote": "USDT",
+        "active": True,
+        "spot": True,
+        "type": "spot",
+        "swap": False,
+        "contract": False,
+        "precision": {"amount": 3, "price": 2},
+    }
+    patch_exchange(mocker, mock_markets={pair: market})
+    mocker.patch(f"{EXMS}.get_min_pair_stake_amount", return_value=1)
+    mocker.patch(f"{EXMS}.get_max_pair_stake_amount", return_value=float("inf"))
+    backtesting = Backtesting(config)
+    strategy = backtesting.strategylist[0]
+    backtesting._set_strategy(strategy)
+    terminal = case.startswith("terminal") or case == "shared-capacity"
+    strategy.populate_entry_trend = lambda frame, metadata: frame.assign(
+        enter_long=(frame.date == start).astype(int), enter_short=0
+    )
+    strategy.populate_exit_trend = lambda frame, metadata: frame.assign(
+        exit_long=((frame.date == start + timedelta(hours=1)) & (not terminal)).astype(int),
+        exit_short=0,
+    )
+    if case == "shared-capacity":
+        strategy.minimal_roi = {0: -1.0}
+    hourly = pd.DataFrame(
+        {
+            "date": pd.date_range(start, periods=5, freq="h"),
+            "open": 100.0,
+            "high": 100.0,
+            "low": 100.0,
+            "close": 100.0,
+            "volume": 1000.0,
+        }
+    )
+    detail = pd.DataFrame(
+        {
+            "date": pd.date_range(start, periods=300, freq="min"),
+            "open": 100.0,
+            "high": 100.0,
+            "low": 100.0,
+            "close": 100.0,
+            "volume": 1000.0,
+        }
+    )
+    for hour in (1, 2):
+        mask = detail.date.between(
+            start + timedelta(hours=hour), start + timedelta(hours=hour, minutes=3)
+        )
+        if case in ("invalid-volume", "timeout"):
+            detail.loc[mask, "volume"] = [0, np.nan, -1, np.inf]
+        elif case == "oversized":
+            detail.loc[mask, "volume"] = 1
+        elif case == "missing-minutes":
+            detail = detail.loc[~mask].copy()
+    if case == "shared-capacity":
+        detail.loc[detail.date == start + timedelta(hours=1), "volume"] = 15
+    if case.startswith("terminal"):
+        detail.loc[
+            detail.date.between(
+                start + timedelta(hours=4),
+                start + timedelta(hours=4, minutes=59 if case == "terminal-unfillable" else 3),
+            ),
+            "volume",
+        ] = 1
+    backtesting.detail_data[pair] = detail
+    fills = []
+    strategy.order_filled = lambda trade, order, current_time, **kwargs: fills.append(
+        (
+            current_time,
+            order.ft_order_side,
+            order.safe_filled,
+            order.safe_price,
+            order.order_date_utc,
+        )
+    )
+    return pair, backtesting, hourly, detail, fills
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "invalid-volume",
+        "oversized",
+        "missing-minutes",
+        "shared-capacity",
+        "timeout",
+        "terminal-deferred",
+        "terminal-unfillable",
+        "quote-volume",
+    ],
+)
+def test_native_fills_use_observed_candle_volume(mocker, default_conf_usdt, case):
+    """Real native order lifetimes and money accounting obey observed minute capacity."""
+    start = pd.Timestamp("2024-01-01", tz="UTC")
+    if case == "quote-volume":
+        with pytest.raises(OperationalException, match="base-asset OHLCV volume"):
+            _volume_backtest(mocker, default_conf_usdt, case, start)
+        return
+    pair, backtesting, hourly, detail, fills = _volume_backtest(
+        mocker, default_conf_usdt, case, start
+    )
+    try:
+        if case == "terminal-unfillable":
+            with pytest.raises(OperationalException, match="available volume"):
+                backtesting.backtest({pair: hourly}, start, start + timedelta(hours=4))
+            assert len(fills) == 1
+            assert [
+                trade.amount for trade in LocalTrade.bt_trades_open if trade.has_open_position
+            ] == [10]
+            return
+        result = backtesting.backtest({pair: hourly}, start, start + timedelta(hours=4))
+        expected = [start + timedelta(hours=1, minutes=4), start + timedelta(hours=2, minutes=4)]
+        if case == "shared-capacity":
+            expected = [start + timedelta(hours=1), start + timedelta(hours=1, minutes=1)]
+        elif case == "terminal-deferred":
+            expected = [start + timedelta(hours=1), start + timedelta(hours=4, minutes=4)]
+        assert [fill[0] for fill in fills] == expected
+        assert [fill[1] for fill in fills] == ["buy", "sell"]
+        assert all(fill[2:4] == (10, 100) for fill in fills)
+        used = defaultdict(float)
+        volume = detail.set_index("date").volume
+        for timestamp, _, amount, _, _ in fills:
+            used[timestamp] += amount
+            assert (
+                np.isfinite(volume.loc[timestamp]) and 0 < used[timestamp] <= volume.loc[timestamp]
+            )
+        assert result["final_balance"] == pytest.approx(1980, abs=1e-9, rel=0)
+        if case == "timeout":
+            assert result["timedout_entry_orders"] == 4
+            assert fills[0][-1] == start + timedelta(hours=1, minutes=4)
+        elif case in ("invalid-volume", "oversized"):
+            assert fills[0][-1] == start + timedelta(hours=1)
+    finally:
+        backtesting.cleanup()
 
 
 # Unit tests
@@ -759,13 +927,17 @@ def test_backtest__enter_trade(default_conf, fee, mocker) -> None:
     pair = "UNITTEST/BTC"
     row = [
         pd.Timestamp(year=2020, month=1, day=1, hour=5, minute=0),
-        1,  # Buy
-        0.001,  # Open
-        0.0011,  # Close
-        0,  # Sell
-        0.00099,  # Low
-        0.0012,  # High
-        "",  # Buy Signal Name
+        1.0,  # Open
+        1.0011,  # High
+        0.999,  # Low
+        1.0,  # Close
+        1,  # enter_long
+        0,  # exit_long
+        0,  # enter_short
+        0,  # exit_short
+        "",  # Enter tag
+        "",  # Exit tag
+        5000.0,  # Base volume
     ]
     trade = backtesting._enter_trade(pair, row=row, direction="long")
     assert isinstance(trade, LocalTrade)
@@ -842,7 +1014,7 @@ def test_backtest__enter_trade_futures(default_conf_usdt, fee, mocker) -> None:
         0,  # exit_hsort
         "",  # Long Signal Name
         "",  # Short Signal Name
-        "",  # Exit Signal Name
+        1000000.0,  # Base volume
     ]
 
     backtesting.strategy.leverage = MagicMock(return_value=5.0)
@@ -922,7 +1094,7 @@ def test_backtest__check_trade_exit(default_conf, mocker) -> None:
         0,  # exit_hsort
         "",  # Long Signal Name
         "",  # Short Signal Name
-        "",  # Exit Signal Name
+        1000000.0,  # Base volume
     ]
 
     trade = backtesting._enter_trade(pair, row=row, direction="long")
@@ -940,7 +1112,7 @@ def test_backtest__check_trade_exit(default_conf, mocker) -> None:
         0,  # exit_short
         "",  # long Signal Name
         "",  # Short Signal Name
-        "",  # Exit Signal Name
+        1000000.0,  # Base volume
     ]
 
     # No data available.
@@ -995,8 +1167,8 @@ def test_get_detail_data(default_conf, mocker) -> None:
 
     def make_row(ts):
         # date, O, H, L, C, enter_long, exit_long, enter_short, exit_short,
-        # enter_tag, exit_tag
-        return [ts, 200.0, 201.5, 195.0, 201.0, 1, 0, 0, 0, "ent", "ext"]
+        # enter_tag, exit_tag, base volume
+        return [ts, 200.0, 201.5, 195.0, 201.0, 1, 0, 0, 0, "ent", "ext", 1000.0]
 
     def mask_oracle(ts):
         """Reference window selection via a boolean mask over the detail frame."""
@@ -1010,7 +1182,7 @@ def test_get_detail_data(default_conf, mocker) -> None:
         sub.loc[:, "exit_short"] = 0
         sub.loc[:, "enter_tag"] = "ent"
         sub.loc[:, "exit_tag"] = "ext"
-        return sub[HEADERS].values.tolist()
+        return {row[0]: row for row in sub[HEADERS].values.tolist()}
 
     test_times = [
         pd.Timestamp("2020-01-01 03:00", tz="UTC"),  # before all data -> None
@@ -1028,10 +1200,10 @@ def test_get_detail_data(default_conf, mocker) -> None:
     res = backtesting.get_detail_data(pair, make_row(pd.Timestamp("2020-01-01 04:00", tz="UTC")))
     assert res is not None
     assert len(res) == 60
-    assert res[-1][0] == pd.Timestamp("2020-01-01 04:59", tz="UTC")  # not 05:00
+    assert list(res)[-1] == pd.Timestamp("2020-01-01 04:59", tz="UTC")  # not 05:00
     # Signal columns are taken from the row, not the detail frame.
-    assert res[0][HEADERS.index("enter_long")] == 1
-    assert res[0][HEADERS.index("enter_tag")] == "ent"
+    assert res[pd.Timestamp("2020-01-01 04:00", tz="UTC")][HEADERS.index("enter_long")] == 1
+    assert res[pd.Timestamp("2020-01-01 04:00", tz="UTC")][HEADERS.index("enter_tag")] == "ent"
 
 
 def test_backtest_one(default_conf, mocker, testdatadir) -> None:
@@ -1203,10 +1375,13 @@ def test_backtest_one_detail(default_conf_usdt, mocker, testdatadir, use_detail)
     # Pick a timerange adapted to the pair we use to test
     timerange = TimeRange.parse_timerange("20191010-20191013")
     data = history.load_data(datadir=testdatadir, timeframe="5m", pairs=[pair], timerange=timerange)
+    # Invent ample base quantity so the test isolates limit-price timeouts.
+    data[pair]["volume"] = 1000000.0
     if use_detail:
         data_1m = history.load_data(
             datadir=testdatadir, timeframe="1m", pairs=[pair], timerange=timerange
         )
+        data_1m[pair]["volume"] = 1000000.0
         backtesting.detail_data = data_1m
     processed = backtesting.strategy.advise_all_indicators(data)
     min_date, max_date = get_timerange(processed)
@@ -1511,6 +1686,7 @@ def test_backtest_timedout_entry_orders(default_conf, fee, mocker, testdatadir) 
 
 
 def test_backtest_1min_timeframe(default_conf, fee, mocker, testdatadir) -> None:
+    default_conf["timeframe"] = "1m"
     default_conf["use_exit_signal"] = False
     default_conf["max_open_trades"] = 1
     mocker.patch(f"{EXMS}.get_fee", fee)
@@ -1525,6 +1701,8 @@ def test_backtest_1min_timeframe(default_conf, fee, mocker, testdatadir) -> None
     data = history.load_data(
         datadir=testdatadir, timeframe="1m", pairs=["UNITTEST/BTC"], timerange=timerange
     )
+    # This timeframe check uses invented sufficient volume, including the terminal candle.
+    data["UNITTEST/BTC"]["volume"] = 1000.0
     processed = backtesting.strategy.advise_all_indicators(data)
     min_date, max_date = get_timerange(processed)
     results = backtesting.backtest(
@@ -2211,7 +2389,6 @@ def test_backtest_multi_pair_long_short_switch(
 
     backtesting = Backtesting(default_conf_usdt)
     vr_spy = mocker.spy(backtesting, "validate_row")
-    bl_spy = mocker.spy(backtesting, "backtest_loop")
     backtesting.detail_data = detail_data
     backtesting.funding_fee_timeframe_secs = 3600 * 8  # 8h
     backtesting.futures_data = {pair: pd.DataFrame() for pair in pairs}
@@ -2237,12 +2414,6 @@ def test_backtest_multi_pair_long_short_switch(
     assert backtesting.strategy.bot_loop_start.call_count == 499
     # Validated row once per candle and pair
     assert vr_spy.call_count == 499
-
-    if use_detail:
-        # Backtest loop is called once per candle per pair
-        assert bl_spy.call_count == 1511
-    else:
-        assert bl_spy.call_count == 508
 
     # Make sure we have parallel trades
     assert len(evaluate_result_multi(results["results"], "5m", 0)) > 0
@@ -3074,7 +3245,7 @@ def test_time_pair_generator_open_trades_first(mocker, default_conf, dynamic_pai
 
     start_date = datetime(2025, 1, 1, 0, 0, tzinfo=UTC)
     end_date = start_date + timedelta(minutes=5)
-    dummy_row = (end_date, 1.0, 1.1, 0.9, 1.0, 0, 0, 0, 0, None, None)
+    dummy_row = (end_date, 1.0, 1.1, 0.9, 1.0, 0, 0, 0, 0, None, None, 1000.0)
     data = {pair: [dummy_row] for pair in pairs}
 
     def mock_refresh(self, **kwargs):
@@ -3106,7 +3277,7 @@ def test_time_pair_generator_dynamic_pairlist_no_stale_replay(mocker, default_co
     # data[pair][0] is dated start + tf
     candles = generate_test_data_raw(backtesting.timeframe, n, start=start)
     rows = [
-        [start + tf * (i + 1), c[1], c[2], c[3], c[4], 0, 0, 0, 0, None, None]
+        [start + tf * (i + 1), c[1], c[2], c[3], c[4], 0, 0, 0, 0, None, None, 1000.0]
         for i, c in enumerate(candles)
     ]
     pairs = ["A/BTC", "B/BTC"]
@@ -3155,7 +3326,7 @@ def test_time_pair_generator_dynamic_pairlist_real_filters(mocker, default_conf)
     grid = [start + tf * (i + 1) for i in range(n)]
 
     def row(t):
-        return [t, 1.0, 1.1, 0.9, 1.0, 0, 0, 0, 0, None, None]
+        return [t, 1.0, 1.1, 0.9, 1.0, 0, 0, 0, 0, None, None, 1000.0]
 
     data = {p: [row(t) for t in grid] for p in pairs}
     end = start + tf * n

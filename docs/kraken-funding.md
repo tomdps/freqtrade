@@ -1,13 +1,17 @@
 # Kraken continuous funding
 
 This fork starts from Freqtrade 2026.9. The local package version
-`2026.9+kraken.3` identifies its Kraken funding correction. The patch targets
+`2026.9+kraken.4` identifies its Kraken funding correction. The patch targets
 backtesting and dry-run accounting; it has not been reconciled against a live
 account ledger.
 
 This version also backports [upstream PR #13644](https://github.com/freqtrade/freqtrade/pull/13644):
 default configuration exports redact the API signing secret and WebSocket token.
 Explicit `show_sensitive` output keeps upstream's existing behavior.
+
+It also backports [upstream's Telegram button authorization](https://github.com/freqtrade/freqtrade/commit/82e4c9604c51523f7e05c5a297167cf2b13a2129).
+Manual entry and exit buttons apply the same configured chat, topic and user
+checks as commands.
 
 Kraken's linear perpetual contracts accrue funding continuously. Each hourly
 rate applies from its timestamp until the next hour, and only the time actually
@@ -44,6 +48,10 @@ open, and a later exit or added entry does not replace it. If a pair's history
 stays unavailable, its funding and bookings keep waiting, with a warning on every
 loop. A gap inside the published history still stops the bot, and backtests still
 refuse any history that does not cover a holding.
+
+Cancelling an unfilled stop leaves accrued funding on the open position, even
+when the response omits the filled quantity or the next rate is not available.
+The cancellation is saved without rebooking the trade or clearing known funding.
 
 Backtests ask for each open trade's funding at every candle, and at every detail
 candle with `--timeframe-detail`. The calculator prepares each funding frame once

@@ -924,8 +924,12 @@ class LocalTrade:
         :return: None
         """
 
-        # Ignore open and cancelled orders
-        if order.status == "open" or order.safe_price is None:
+        # Unfilled Kraken updates must not consume or reset accrued funding.
+        if (
+            order.status == "open"
+            or order.safe_price is None
+            or (self.exchange == "krakenfutures" and order.safe_filled <= 0)
+        ):
             return
 
         logger.info(f"Updating trade (id={self.id}) ...")

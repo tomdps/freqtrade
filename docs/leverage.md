@@ -159,6 +159,17 @@ automatically. Complete funding and mark data are still required. A paper simula
 reconstruct a historical liquidation's execution while it was offline. Candle timing, mark/last-price
 differences, liquidation fees and insurance-fund treatment remain simulation limitations.
 
+Backtests skip unchanged discrete funding calculations between known settlement timestamps.
+The original calculator and addition order are retained whenever funding, exposure, the last fill
+or the source changes; forced fill and close calculations always run. Zero-rate settlements still
+advance the native payment cursor, and deferred payments still use native wallet allocation.
+This transient check is reset for each backtest. It does not change hourly accrual on other venues,
+funding arithmetic, cash allocation, candle fills or source-completeness requirements.
+
+Wallet summaries use the last captured balance and rate for each currency at a timestamp,
+then total distinct currencies. Repeated captures are observations of the same holdings.
+The summary describes captured balances; open futures price profit needs separate valuation.
+
 ## Unavailable funding rates
 
 For futures data, exchanges commonly provide the futures candles, the marks, and the funding rates. However, it is common that whilst candles and marks might be available, the funding rates are not. This can affect backtesting timeranges, i.e. you may only be able to test recent timeranges and not earlier, experiencing the `No data found. Terminating.` error. To get around this, add the `futures_funding_rate` config option as listed in [configuration.md](configuration.md), and it is recommended that you set this to `0`, unless you know a given specific funding rate for your pair, exchange and timerange. Setting this to anything other than `0` can have drastic effects on your profit calculations within strategy, e.g. within the `custom_exit`, `custom_stoploss`, etc functions.

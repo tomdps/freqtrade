@@ -14,8 +14,8 @@ from datetime import datetime, timedelta
 from math import isfinite
 from typing import TYPE_CHECKING
 
-from numpy import isnan, nan
-from pandas import DataFrame, Series
+from numpy import array_equal, isnan, nan
+from pandas import DataFrame, Series, Timestamp
 
 from freqtrade import constants
 from freqtrade.configuration import TimeRange, validate_config_consistency
@@ -501,6 +501,7 @@ class Backtesting:
         # Ensure logging is disabled in other processes during hyperopt
         LoggingMixin.show_output = False
         self.rejected_trades = 0
+        self._funding_fee_checks: dict[str, tuple] = {}
         self._filled_volume: dict[tuple[str, datetime], float] = {}
         self.timedout_entry_orders = 0
         self.timedout_exit_orders = 0
@@ -1055,6 +1056,64 @@ class Backtesting:
                 or self.exchange.get_option("funding_fee_continuous", False) is True
                 or (current_time.timestamp() % self.funding_fee_timeframe_secs) == 0
             ):
+                memoize = False
+                if (
+                    not force
+                    and self.wallets.uses_isolated_funding
+                    and not self.futures_data[trade.pair].empty
+                ):
+                    frame = self.futures_data[trade.pair]
+                    dates = frame["date"]
+                    clocks = dates.array.asi8
+                    rates = frame["open_fund"].to_numpy(copy=False)
+                    marks = frame["open_mark"].to_numpy(copy=False)
+                    # The persisted native settlement cursor has microsecond precision.
+                    memoize = (
+                        rates.dtype.kind in "fiu"
+                        and marks.dtype.kind in "fiu"
+                        and not (dates.dtype.unit == "ns" and (clocks % 1000).any())
+                    )
+                    state = (
+                        trade,
+                        trade.amount,
+                        trade.is_short,
+                        trade.date_last_filled_utc,
+                        trade.funding_fee_running,
+                        trade.funding_fees,
+                        trade.funding_fee_processed,
+                        trade.funding_fee_margin,
+                        trade.funding_fee_last_time_utc,
+                        str(dates.dtype),
+                        rates.dtype.str,
+                        marks.dtype.str,
+                    )
+                    previous = self._funding_fee_checks.get(trade.pair)
+                    if memoize and previous is not None:
+                        (
+                            old_frame,
+                            old_state,
+                            checked,
+                            next_event,
+                            end,
+                            old_clocks,
+                            old_rates,
+                            old_marks,
+                        ) = previous
+                        if (
+                            old_frame is frame
+                            and old_state == state
+                            and checked <= current_time
+                            and (next_event is None or current_time < next_event)
+                            and array_equal(clocks, old_clocks)
+                            and array_equal(rates[:end], old_rates, equal_nan=True)
+                            and array_equal(marks[:end], old_marks, equal_nan=True)
+                        ):
+                            # An earlier deferred call may still need native wallet allocation.
+                            if not defer_wallet and trade._funding_fee_payments:
+                                self.wallets.update()
+                            elif not trade._funding_fee_payments:
+                                trade._funding_fee_payments = []
+                            return
                 # Funding fee interval.
                 trade.set_funding_fees(
                     self.exchange.calculate_funding_fees(
@@ -1076,6 +1135,37 @@ class Backtesting:
                     )
                     if not defer_wallet and trade._funding_fee_payments:
                         self.wallets.update()
+
+                if memoize and dates.is_monotonic_increasing:
+                    upper = (
+                        Timestamp(current_time).floor(dates.dtype.unit).as_unit(dates.dtype.unit)
+                    )
+                    end = int(dates.searchsorted(upper, side="right"))
+                    next_event = dates.iloc[end] if end < len(dates) else None
+                    state = (
+                        trade,
+                        trade.amount,
+                        trade.is_short,
+                        trade.date_last_filled_utc,
+                        trade.funding_fee_running,
+                        trade.funding_fees,
+                        trade.funding_fee_processed,
+                        trade.funding_fee_margin,
+                        trade.funding_fee_last_time_utc,
+                        str(dates.dtype),
+                        rates.dtype.str,
+                        marks.dtype.str,
+                    )
+                    self._funding_fee_checks[trade.pair] = (
+                        frame,
+                        state,
+                        current_time,
+                        next_event,
+                        end,
+                        clocks.copy(),
+                        rates[:end].copy(),
+                        marks[:end].copy(),
+                    )
 
     def get_valid_entry_price_and_stake(
         self,

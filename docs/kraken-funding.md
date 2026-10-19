@@ -1,7 +1,7 @@
 # Kraken continuous funding
 
 This fork starts from Freqtrade 2026.8. The local package version
-`2026.8+kraken.6` identifies its funding and native fill corrections. The patch
+`2026.8+kraken.7` identifies its funding and native fill corrections. The patch
 targets backtesting and dry-run accounting; it has not been reconciled against
 a live account ledger.
 

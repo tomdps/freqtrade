@@ -52,6 +52,8 @@ def generate_wallet_stats(wallet_df: DataFrame, stake_currency: str) -> dict[str
     """Generate wallet statistics from the wallet DataFrame."""
     if wallet_df is None or wallet_df.empty:
         return {}
+    # Captures are appended in order; repeated snapshots are not separate holdings.
+    wallet_df = wallet_df.drop_duplicates(["date", "currency"], keep="last")
     wallet_df.loc[:, "total_quote"] = wallet_df["rate"] * wallet_df["balance"]
     # Group by date to get total wallet value at each timestamp
     wallet = wallet_df.groupby("date")["total_quote"].sum().reset_index()

@@ -618,7 +618,7 @@ class Wallets:
             wallet_records.append(position_record)
 
         for wallet in self.get_all_balances().values():
-            if wallet.total == 0:
+            if wallet.total == 0 and wallet.free == 0:
                 continue
             rate = self._exchange.get_conversion_rate(wallet.currency, self._stake_currency)
             is_bot_managed = (

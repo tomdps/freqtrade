@@ -787,7 +787,8 @@ def test_dry_run_wallet_initialization(mocker, default_conf_usdt, config, wallet
 
 
 @pytest.mark.usefixtures("init_persistence")
-def test_record_wallet_state_stores_wallet_history(mocker, default_conf_usdt):
+@pytest.mark.parametrize("zero_total", [False, True], ids=["ordinary", "offsetting-signed-wallet"])
+def test_record_wallet_state_stores_wallet_history(mocker, default_conf_usdt, zero_total):
     freqtrade = get_patched_freqtradebot(mocker, default_conf_usdt)
     stake_currency = default_conf_usdt["stake_currency"]
     freqtrade.wallets._wallets = {
@@ -803,8 +804,22 @@ def test_record_wallet_state_stores_wallet_history(mocker, default_conf_usdt):
             side="long",
         )
     }
+    if zero_total:
+        # Positive cash can offset a negative isolated wallet without erasing position equity.
+        freqtrade.wallets._wallets = {
+            stake_currency: Wallet(stake_currency, free=500.0, used=-500.0, total=0.0),
+            "BTC": Wallet("BTC", free=0.0, used=0.0, total=0.0),
+        }
+        freqtrade.wallets._positions["ETH/USDT:USDT"] = PositionWallet(
+            symbol="ETH/USDT:USDT",
+            position=10.0,
+            collateral=-500.0,
+            leverage=1.0,
+            side="long",
+            entry_value=1000.0,
+        )
 
-    conversion_rates = {stake_currency: 1.0, "BTC": 70000, "ETH": 2500.1}
+    conversion_rates = {stake_currency: 1.0, "BTC": 70000, "ETH": 300.0 if zero_total else 2500.1}
     mocker.patch.object(
         freqtrade.exchange,
         "get_conversion_rate",
@@ -820,18 +835,27 @@ def test_record_wallet_state_stores_wallet_history(mocker, default_conf_usdt):
     freqtrade.wallets.record_wallet_state()
 
     wallet_entries = WalletHistory.session.query(WalletHistory).all()
-    assert len(wallet_entries) == 3
+    # Cash plus marked position equity must survive the database write exactly once.
+    assert sum(entry.total_quote for entry in wallet_entries) == pytest.approx(
+        2000.0 if zero_total else 212147.08
+    )
+    assert len(wallet_entries) == (2 if zero_total else 3)
     assert "total_quote" in repr(wallet_entries[0])
     assert "WalletHistory(" in repr(wallet_entries[0])
 
     records_by_currency = {entry.currency: entry for entry in wallet_entries}
-    assert records_by_currency[stake_currency].balance == 149
+    assert records_by_currency[stake_currency].balance == (500 if zero_total else 149)
     assert records_by_currency[stake_currency].rate == 1.0
-    assert records_by_currency["BTC"].rate == 70000
-    assert records_by_currency["BTC"].balance == 3
-    assert not records_by_currency["BTC"].bot_managed
-    assert records_by_currency["ETH/USDT:USDT"].balance == 0.8
-    assert records_by_currency["ETH/USDT:USDT"].rate == 2500.1
+    if zero_total:
+        assert "BTC" not in records_by_currency
+        assert records_by_currency["ETH/USDT:USDT"].total_quote == 1500
+        assert records_by_currency["ETH/USDT:USDT"].collateral == -500
+    else:
+        assert records_by_currency["BTC"].rate == 70000
+        assert records_by_currency["BTC"].balance == 3
+        assert not records_by_currency["BTC"].bot_managed
+    assert records_by_currency["ETH/USDT:USDT"].balance == (10.0 if zero_total else 0.8)
+    assert records_by_currency["ETH/USDT:USDT"].rate == conversion_rates["ETH"]
     assert records_by_currency["ETH/USDT:USDT"].bot_managed is True
 
 

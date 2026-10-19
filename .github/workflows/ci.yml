@@ -2,9 +2,9 @@ name: Funding regression checks
 
 on:
   push:
-    branches: [stable]
+    branches: [stable, stable-2026.8]
   pull_request:
-    branches: [stable]
+    branches: [stable, stable-2026.8]
   workflow_dispatch:
 
 permissions:

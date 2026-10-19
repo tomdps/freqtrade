@@ -92,6 +92,10 @@ def test_rpc_trade_status(default_conf, ticker, fee, mocker) -> None:
         "liquidation_price": None,
         "is_short": False,
         "funding_fees": 0.0,
+        "funding_fee_running": 0.0,
+        "funding_fee_processed": 0.0,
+        "funding_fee_margin": 0.0,
+        "funding_fee_last_timestamp": None,
         "trading_mode": TradingMode.SPOT,
         "amount_precision": 8.0,
         "price_precision": 8.0,
@@ -152,6 +156,7 @@ def test_rpc_trade_status(default_conf, ticker, fee, mocker) -> None:
     response_unfilled.update(
         {
             "amount": 0.0,
+            "funding_fee_running": None,
             "open_trade_value": 0.0,
             "stoploss_entry_dist": 0.0,
             "stoploss_entry_dist_ratio": 0.0,

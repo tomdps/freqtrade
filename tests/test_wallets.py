@@ -1,13 +1,19 @@
 # pragma pylint: disable=missing-docstring
+import json
 from copy import deepcopy
+from datetime import timedelta
 from unittest.mock import MagicMock
 
+import pandas as pd
 import pytest
 from sqlalchemy import select
 
 from freqtrade.constants import UNLIMITED_STAKE_AMOUNT
-from freqtrade.exceptions import DependencyException
+from freqtrade.enums import CandleType, ExitCheckTuple, ExitType
+from freqtrade.exceptions import DependencyException, OperationalException
+from freqtrade.freqtradebot import FreqtradeBot
 from freqtrade.persistence import Trade, WalletHistory
+from freqtrade.util import dt_utc
 from freqtrade.wallets import PositionWallet, Wallet
 from tests.conftest import (
     EXMS,
@@ -17,6 +23,110 @@ from tests.conftest import (
     log_has_re,
     patch_wallet,
 )
+
+
+@pytest.mark.parametrize("is_short", [False, True], ids=["long", "short"])
+@pytest.mark.parametrize("restart_late", [False, True], ids=["caught-up", "missed-settlements"])
+def test_isolated_funding_cash_margin_restart_and_full_exit(
+    mocker, default_conf_usdt, time_machine, tmp_path, is_short, restart_late
+):
+    """A restart cannot repay old debits or restore spent margin from a later credit."""
+    start = dt_utc(2024, 1, 1, 7, 55)
+    time_machine.move_to(start, tick=False)
+    pairs = ["ETH/USDT", "LTC/USDT"]
+    conf = default_conf_usdt
+    conf.update(
+        trading_mode="futures",
+        margin_mode="isolated",
+        dry_run_wallet=2104.0,
+        stake_amount=1000,
+        max_open_trades=2,
+        tradable_balance_ratio=1,
+        liquidation_buffer=0,
+        db_url=f"sqlite:///{tmp_path / 'funding.sqlite'}",
+    )
+    conf["exchange"].update(name="binance", _ft_has_params={"funding_fee_continuous": True})
+    bot = get_patched_freqtradebot(mocker, conf)
+    mocker.patch.multiple(
+        EXMS,
+        get_rate=MagicMock(return_value=100.0),
+        get_min_pair_stake_amount=MagicMock(return_value=1),
+        get_max_pair_stake_amount=MagicMock(return_value=1e6),
+        get_fee=MagicMock(return_value=0.002),
+        get_max_leverage=MagicMock(return_value=1),
+        get_maintenance_ratio_and_amt=MagicMock(return_value=(0.01, 0)),
+        get_dry_market_fill_price=MagicMock(return_value=100.0),
+        fetch_l2_order_book=MagicMock(return_value={"bids": [[100, 1000]], "asks": [[100, 1000]]}),
+    )
+    events = pd.date_range(dt_utc(2024, 1, 1, 8), periods=3, freq="8h")
+    direction = 1 if is_short else -1
+    frames = {}
+    for pair, payments in zip(pairs, [[-150, 200, -100], [-80, 0, 0]], strict=True):
+        frames[(pair, "1h", CandleType.FUNDING_RATE)] = pd.DataFrame(
+            {"date": events, "funding_rate": [p / 1000 * direction for p in payments]}
+        )
+        frames[(pair, "1h", CandleType.MARK)] = pd.DataFrame({"date": events, "open": 100.0})
+    mocker.patch(f"{EXMS}.refresh_latest_ohlcv", return_value=frames)
+    for pair in pairs:
+        assert bot.execute_entry(pair, 1000, ordertype="market", is_short=is_short)
+    assert bot.wallets.get_free("USDT") == pytest.approx(100)
+    assert bot.wallets.get_total("USDT") == pytest.approx(2100)
+
+    if not restart_late:
+        time_machine.move_to(events[0].to_pydatetime(), tick=False)
+        bot.update_funding_fees()
+        trades = Trade.get_open_trades()
+        assert [t.funding_fees for t in trades] == pytest.approx([-150, -80])
+        assert bot.wallets.get_free("USDT") == pytest.approx(0)
+        assert bot.wallets.get_used("USDT") == pytest.approx(1870)
+        assert [t.isolated_collateral for t in trades] == pytest.approx([950, 920])
+        assert [t.liquidation_price for t in trades] == pytest.approx(
+            [1950 / 10.1, 1920 / 10.1] if is_short else [50 / 9.9, 80 / 9.9]
+        )
+        restored = Trade.from_json(json.dumps(trades[0].to_json()))
+        assert restored.funding_fee_processed == pytest.approx(-150)
+        assert restored.funding_fee_margin == pytest.approx(-50)
+        assert restored.funding_fees_since_last_exit == pytest.approx(-150)
+    Trade.commit()
+    Trade.session.remove()
+    if restart_late:
+        # No refresh saw either the margin-funded debit or the subsequent credit.
+        time_machine.move_to(events[1].to_pydatetime(), tick=False)
+    bot = FreqtradeBot(conf)
+    bot.update_funding_fees()
+    trades = Trade.get_open_trades()
+    assert [t.isolated_collateral for t in trades] == pytest.approx([950, 920])
+    assert bot.wallets.get_free("USDT") == pytest.approx(200 if restart_late else 0)
+    assert bot.wallets.get_total("USDT") == pytest.approx(2070 if restart_late else 1870)
+
+    time_machine.move_to(events[1].to_pydatetime(), tick=False)
+    bot.update_funding_fees()
+    assert bot.wallets.get_free("USDT") == pytest.approx(200)
+    assert [t.isolated_collateral for t in trades] == pytest.approx([950, 920])
+    time_machine.move_to(events[2].to_pydatetime(), tick=False)
+    bot.update_funding_fees()
+    assert bot.wallets.get_free("USDT") == pytest.approx(100)
+    assert bot.wallets.get_total("USDT") == pytest.approx(1970)
+    assert bot.wallets.get_total_stake_amount() == pytest.approx(1970)
+    assert bot.wallets.get_starting_balance() == pytest.approx(2104)
+    assert [t.isolated_collateral for t in trades] == pytest.approx([950, 920])
+    time_machine.move_to(events[2].to_pydatetime() + timedelta(minutes=1), tick=False)
+    for trade in trades:
+        assert bot.execute_trade_exit(
+            trade, 100, ExitCheckTuple(ExitType.EXIT_SIGNAL), ordertype="market"
+        )
+        assert not trade.is_open
+    bot.wallets.update()
+    # Four actual fees of 2, with net funding -130: no separate margin loss in final P&L.
+    assert bot.wallets.get_total("USDT") == pytest.approx(2104 - 8 - 130)
+    assert bot.wallets.get_used("USDT") == 0
+    assert bot.wallets.get_free("USDT") == pytest.approx(1966)
+    # An old database/import cannot reconstruct the historical cash/margin allocation.
+    trades[0].is_open = True
+    trades[0].funding_fee_margin = None
+    Trade.commit()
+    with pytest.raises(OperationalException, match="Cannot recover isolated funding allocation"):
+        bot.wallets.update()
 
 
 def test_sync_wallet_at_boot(mocker, default_conf):
@@ -677,7 +787,8 @@ def test_dry_run_wallet_initialization(mocker, default_conf_usdt, config, wallet
 
 
 @pytest.mark.usefixtures("init_persistence")
-def test_record_wallet_state_stores_wallet_history(mocker, default_conf_usdt):
+@pytest.mark.parametrize("zero_total", [False, True], ids=["ordinary", "offsetting-signed-wallet"])
+def test_record_wallet_state_stores_wallet_history(mocker, default_conf_usdt, zero_total):
     freqtrade = get_patched_freqtradebot(mocker, default_conf_usdt)
     stake_currency = default_conf_usdt["stake_currency"]
     freqtrade.wallets._wallets = {
@@ -693,8 +804,22 @@ def test_record_wallet_state_stores_wallet_history(mocker, default_conf_usdt):
             side="long",
         )
     }
+    if zero_total:
+        # Positive cash can offset a negative isolated wallet without erasing position equity.
+        freqtrade.wallets._wallets = {
+            stake_currency: Wallet(stake_currency, free=500.0, used=-500.0, total=0.0),
+            "BTC": Wallet("BTC", free=0.0, used=0.0, total=0.0),
+        }
+        freqtrade.wallets._positions["ETH/USDT:USDT"] = PositionWallet(
+            symbol="ETH/USDT:USDT",
+            position=10.0,
+            collateral=-500.0,
+            leverage=1.0,
+            side="long",
+            entry_value=1000.0,
+        )
 
-    conversion_rates = {stake_currency: 1.0, "BTC": 70000, "ETH": 2500.1}
+    conversion_rates = {stake_currency: 1.0, "BTC": 70000, "ETH": 300.0 if zero_total else 2500.1}
     mocker.patch.object(
         freqtrade.exchange,
         "get_conversion_rate",
@@ -710,18 +835,27 @@ def test_record_wallet_state_stores_wallet_history(mocker, default_conf_usdt):
     freqtrade.wallets.record_wallet_state()
 
     wallet_entries = WalletHistory.session.query(WalletHistory).all()
-    assert len(wallet_entries) == 3
+    # Cash plus marked position equity must survive the database write exactly once.
+    assert sum(entry.total_quote for entry in wallet_entries) == pytest.approx(
+        2000.0 if zero_total else 212147.08
+    )
+    assert len(wallet_entries) == (2 if zero_total else 3)
     assert "total_quote" in repr(wallet_entries[0])
     assert "WalletHistory(" in repr(wallet_entries[0])
 
     records_by_currency = {entry.currency: entry for entry in wallet_entries}
-    assert records_by_currency[stake_currency].balance == 149
+    assert records_by_currency[stake_currency].balance == (500 if zero_total else 149)
     assert records_by_currency[stake_currency].rate == 1.0
-    assert records_by_currency["BTC"].rate == 70000
-    assert records_by_currency["BTC"].balance == 3
-    assert not records_by_currency["BTC"].bot_managed
-    assert records_by_currency["ETH/USDT:USDT"].balance == 0.8
-    assert records_by_currency["ETH/USDT:USDT"].rate == 2500.1
+    if zero_total:
+        assert "BTC" not in records_by_currency
+        assert records_by_currency["ETH/USDT:USDT"].total_quote == 1500
+        assert records_by_currency["ETH/USDT:USDT"].collateral == -500
+    else:
+        assert records_by_currency["BTC"].rate == 70000
+        assert records_by_currency["BTC"].balance == 3
+        assert not records_by_currency["BTC"].bot_managed
+    assert records_by_currency["ETH/USDT:USDT"].balance == (10.0 if zero_total else 0.8)
+    assert records_by_currency["ETH/USDT:USDT"].rate == conversion_rates["ETH"]
     assert records_by_currency["ETH/USDT:USDT"].bot_managed is True
 
 

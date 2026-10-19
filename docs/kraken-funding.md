@@ -1,7 +1,7 @@
 # Kraken continuous funding
 
 This fork starts from Freqtrade 2026.8. The local package version
-`2026.8+kraken.4` identifies its Kraken funding correction. The patch targets
+`2026.8+kraken.5` identifies its funding corrections. The patch targets
 backtesting and dry-run accounting; it has not been reconciled against a live
 account ledger.
 
@@ -15,7 +15,9 @@ The calculator uses Kraken's absolute hourly rate per base unit. A relative rate
 multiplied by a mark candle is not an exact substitute. Downloaded funding frames
 retain the existing relative `funding_rate` for strategy signals and an optional
 `funding_rate_absolute` for payments, using the existing JSON, Feather or Parquet
-format. Other exchanges keep their existing columns and accounting.
+format. Other exchanges keep their existing funding columns and payment calculators.
+Binance's opt-in isolated cash/margin allocation is described in
+[Funding and isolated collateral](leverage.md#funding-and-isolated-collateral-in-simulations).
 
 Old Kraken files containing only relative rates are rejected for payment
 calculation. Download the required funding history into a separate directory;
@@ -52,7 +54,7 @@ the funding and wallet refresh, since nothing accrues.
 
 ## Maintenance
 
-Keep changes limited to this correction and its regression tests. Before adopting
+Keep changes limited to these funding/collateral corrections and their regression tests. Before adopting
 an upstream release, replay the patch in a branch, run the offline financial and
 data tests from `.github/workflows/ci.yml`, review the exact commit and require
 passing CI. Remove the local correction when the upstream implementation passes

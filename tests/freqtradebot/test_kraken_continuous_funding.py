@@ -1,7 +1,7 @@
 """Offline simulated orders exercise Kraken funding through native bot and wallets."""
 
 from datetime import timedelta
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
@@ -9,6 +9,7 @@ from sqlalchemy import select
 
 from freqtrade.enums import CandleType, ExitCheckTuple, ExitType, RPCMessageType
 from freqtrade.freqtradebot import FreqtradeBot
+from freqtrade.leverage.liquidation_price import update_liquidation_prices
 from freqtrade.persistence import Order, Trade
 from freqtrade.util import dt_utc
 from tests.conftest import EXMS, patch_exchange, patch_freqtradebot
@@ -67,11 +68,17 @@ def make_bot(mocker, conf):
 
 
 @pytest.mark.parametrize("short", [False, True])
+@pytest.mark.parametrize("refresh", [None, "changed", "unchanged"])
 def test_dry_entry_add_reduce_close_and_repeated_poll(
-    mocker, default_conf_usdt, time_machine, short
+    mocker, default_conf_usdt, time_machine, short, refresh
 ):
     time_machine.move_to(START, tick=False)
     bot = make_bot(mocker, default_conf_usdt)
+    scale = 200 if refresh else 1
+    if refresh:
+        bot.exchange.refresh_latest_ohlcv.return_value = {
+            FUNDING: history().assign(funding_rate_absolute=2.0)
+        }
     assert bot.execute_entry(PAIR, 1000.0, ordertype="market", is_short=short)
     trade = Trade.session.scalars(select(Trade)).one()
     assert trade.amount == 10
@@ -81,30 +88,54 @@ def test_dry_entry_add_reduce_close_and_repeated_poll(
     time_machine.move_to(START + timedelta(minutes=30), tick=False)
     bot.update_funding_fees()
     bot.wallets.update()
-    assert trade.funding_fees == pytest.approx(sign * 0.05)
-    assert bot.wallets.get_total("USDT") == pytest.approx(10000 + sign * 0.05)
+    assert trade.funding_fees == pytest.approx(sign * 0.05 * scale)
+    assert bot.wallets.get_total("USDT") == pytest.approx(10000 + sign * 0.05 * scale)
     assert bot.execute_entry(PAIR, 1000.0, trade=trade, ordertype="market", is_short=short)
     assert trade.amount == 20
-    assert trade.funding_fees == pytest.approx(sign * 0.05)
+    assert trade.funding_fees == pytest.approx(sign * 0.05 * scale)
     addition = trade.orders[-1]
-    assert addition.funding_fee == pytest.approx(sign * 0.05)
+    assert addition.funding_fee == pytest.approx(sign * 0.05 * scale)
     bot.update_trade_state(trade, addition.order_id)
-    assert addition.funding_fee == pytest.approx(sign * 0.05)
+    assert addition.funding_fee == pytest.approx(sign * 0.05 * scale)
 
     time_machine.move_to(START + timedelta(minutes=45), tick=False)
     assert bot.execute_trade_exit(
         trade, 100, ExitCheckTuple(ExitType.EXIT_SIGNAL), ordertype="market", sub_trade_amt=10
     )
     assert trade.amount == 10
-    assert trade.realized_profit == pytest.approx(sign * 0.1)
-    assert trade.funding_fees == pytest.approx(sign * 0.1)
+    assert trade.realized_profit == pytest.approx(sign * 0.1 * scale)
+    assert trade.funding_fees == pytest.approx(sign * 0.1 * scale)
     partial_fill = [
         call.args[0]
         for call in bot.rpc.send_msg.call_args_list
         if call.args[0]["type"] == RPCMessageType.EXIT_FILL and call.args[0]["sub_trade"]
     ][-1]
-    assert partial_fill["profit_amount"] == pytest.approx(sign * 0.1)
-    assert partial_fill["profit_ratio"] == pytest.approx(sign * 0.0001)
+    assert partial_fill["profit_amount"] == pytest.approx(sign * 0.1 * scale)
+    assert partial_fill["profit_ratio"] == pytest.approx(sign * 0.0001 * scale)
+    if refresh:
+        # Closed orders already carry signed funding of 20; the new segment is also 20.
+        end = START + timedelta(minutes=105)
+        time_machine.move_to(end, tick=False)
+        if refresh == "unchanged":
+            bot.update_funding_fees()
+            assert trade.funding_fees == sign * 40
+        trade.set_liquidation_price(130 if short else 70)
+        position_price = 120 if short else 80
+        expected = 119 if short else 81  # Existing 5% liquidation buffer around entry 100.
+        with (
+            patch.dict(bot.config, {"dry_run": False}),
+            patch.object(bot.exchange, "exchange_has", return_value=True),
+            patch.object(
+                bot.exchange, "fetch_positions", return_value=[{"liquidationPrice": position_price}]
+            ),
+            patch("freqtrade.freqtradebot.update_liquidation_prices", update_liquidation_prices),
+        ):
+            assert bot._update_continuous_funding(trade, end, update_wallet=False)
+        assert trade.funding_fees == sign * 40
+        assert trade.liquidation_price == (
+            expected if refresh == "changed" else (130 if short else 70)
+        )
+        return
     time_machine.move_to(START + timedelta(minutes=60), tick=False)
     bot.update_funding_fees()
     bot.wallets.update()

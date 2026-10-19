@@ -3,12 +3,14 @@
 
 import logging
 from datetime import datetime, timedelta
+from math import isclose
 from typing import Literal, NamedTuple
 
 from freqtrade.constants import UNLIMITED_STAKE_AMOUNT, Config, IntOrInf
-from freqtrade.enums import RunMode, TradingMode
-from freqtrade.exceptions import DependencyException
+from freqtrade.enums import MarginMode, RunMode, TradingMode
+from freqtrade.exceptions import DependencyException, OperationalException
 from freqtrade.exchange import Exchange
+from freqtrade.leverage.liquidation_price import update_liquidation_prices
 from freqtrade.misc import safe_value_fallback
 from freqtrade.persistence import LocalTrade, Trade, WalletHistory
 from freqtrade.util import dt_floor_day, dt_now
@@ -33,6 +35,15 @@ class PositionWallet(NamedTuple):
     side: str = "long"
     # Unrealized PnL as reported by the exchange. Always 0 in dry-run
     unrealized_pnl: float = 0
+    # Dry-run entry notional stays fixed when funding consumes isolated collateral.
+    entry_value: float | None = None
+
+    def estimate_value(self, rate: float) -> float:
+        entry_value = self.entry_value
+        if entry_value is None:
+            entry_value = self.collateral * (self.leverage or 1.0)
+        pnl = rate * self.position - entry_value
+        return self.collateral + (pnl if self.side == "long" else -pnl)
 
 
 class Wallets:
@@ -52,6 +63,10 @@ class Wallets:
             self._start_cap = _start_cap
 
         self._last_wallet_refresh: datetime | None = None
+        if self.uses_isolated_funding and config.get("position_adjustment_enable", False):
+            raise OperationalException(
+                "Simulated isolated cash-first funding supports one entry and full exits only."
+            )
         self.update()
 
     def __repr__(self) -> str:
@@ -110,6 +125,75 @@ class Wallets:
             return 0.0
         return sum(trade.funding_fees_since_last_exit for trade in trades)
 
+    @property
+    def uses_isolated_funding(self) -> bool:
+        return (
+            self._config["dry_run"]
+            and self._config.get("trading_mode") == TradingMode.FUTURES
+            and self._config.get("margin_mode") == MarginMode.ISOLATED
+            and self._exchange.get_option("funding_fee_continuous", False) is True
+            and self._exchange.get_option("funding_fee_cash_first", False) is True
+        )
+
+    def _allocate_isolated_funding(self, trades: list, free: float) -> None:
+        """Allocate each new payment once; credits do not restore previously spent margin."""
+        for trade in trades:
+            entries = trade.select_filled_orders(trade.entry_side)
+            exits = trade.select_filled_orders(trade.exit_side)
+            if len(entries) > 1 or (
+                exits
+                and (
+                    len(exits) > 1
+                    or not entries
+                    or exits[0].safe_amount_after_fee != entries[0].safe_amount_after_fee
+                )
+            ):
+                raise OperationalException(
+                    "Simulated isolated cash-first funding supports one entry and full exits only."
+                )
+            if trade.funding_fee_processed is None or trade.funding_fee_margin is None:
+                raise OperationalException(
+                    "Cannot recover isolated funding allocation for an older simulated trade. "
+                    "Start a new simulation; aggregate funding cannot recover its margin history."
+                )
+        pending = []
+        for trade in trades:
+            payments = [
+                (date, delta)
+                for date, delta in (trade._funding_fee_payments or [])
+                if trade.funding_fee_last_time_utc is None or date > trade.funding_fee_last_time_utc
+            ]
+            if not isclose(
+                (trade.funding_fees or 0.0) - trade.funding_fee_processed,
+                sum(delta for _, delta in payments),
+                abs_tol=1e-8,
+            ):
+                raise OperationalException("Funding changed without its individual settlements.")
+            pending.extend(
+                (date, trade.open_date_utc, trade.id or 0, trade.pair, trade, delta)
+                for date, delta in payments
+            )
+        free -= sum(item[-1] for item in pending)
+        # Chronological payments; native trade order breaks simultaneous settlement ties.
+        for date, _, _, _, trade, delta in sorted(pending, key=lambda item: item[:4]):
+            if delta < 0:
+                margin_payment = max(0.0, -delta - max(0.0, free))
+                trade.funding_fee_margin -= margin_payment
+                free += margin_payment
+                if margin_payment:
+                    update_liquidation_prices(
+                        trade,
+                        exchange=self._exchange,
+                        wallets=self,
+                        stake_currency=self._stake_currency,
+                        dry_run=True,
+                    )
+            free += delta
+            trade.funding_fee_processed += delta
+            trade.funding_fee_last_time = date
+        for trade in trades:
+            trade._funding_fee_payments = None
+
     def _update_dry(self) -> None:
         """
         Update from database in dry-run mode
@@ -130,6 +214,17 @@ class Wallets:
         tot_profit += sum(trade.realized_profit for trade in open_trades)
         tot_profit += self._unrealized_funding(open_trades)
         tot_in_trades = sum(trade.stake_amount for trade in open_trades)
+        if self.uses_isolated_funding:
+            # Entry fees have already been paid; exit fees are booked only on an actual exit.
+            tot_profit -= sum(
+                trade.amount * trade.open_rate * trade.fee_open for trade in open_trades
+            )
+            tot_in_trades = sum(trade.isolated_collateral for trade in open_trades)
+            self._allocate_isolated_funding(
+                open_trades,
+                self._start_cap.get(self._stake_currency, 0) + tot_profit - tot_in_trades,
+            )
+            tot_in_trades = sum(trade.isolated_collateral for trade in open_trades)
         used_stake = 0.0
 
         if self._config.get("trading_mode", "spot") != TradingMode.FUTURES:
@@ -157,8 +252,9 @@ class Wallets:
                     position.pair,
                     position=position.amount,
                     leverage=position.leverage,
-                    collateral=position.stake_amount,
+                    collateral=position.isolated_collateral,
                     side=position.trade_direction,
+                    entry_value=position.amount * position.open_rate,
                 )
 
             used_stake = tot_in_trades
@@ -312,6 +408,8 @@ class Wallets:
         """
         if "available_capital" in self._config:
             return self._config["available_capital"]
+        elif self.uses_isolated_funding:
+            return self._start_cap[self._stake_currency] * self._config["tradable_balance_ratio"]
         else:
             tot_profit = Trade.get_total_closed_profit()
             open_stakes = Trade.total_open_trades_stakes()
@@ -320,6 +418,13 @@ class Wallets:
                 "tradable_balance_ratio"
             ]
 
+    def _open_stakes(self) -> float:
+        return (
+            self.get_used(self._stake_currency)
+            if self.uses_isolated_funding
+            else Trade.total_open_trades_stakes()
+        )
+
     def get_total_stake_amount(self):
         """
         Return the total currently available balance in stake currency, including tied up stake and
@@ -327,7 +432,7 @@ class Wallets:
         Calculated as
         (<open_trade stakes> + free amount) * tradable_balance_ratio
         """
-        val_tied_up = Trade.total_open_trades_stakes()
+        val_tied_up = self._open_stakes()
         if "available_capital" in self._config:
             starting_balance = self._config["available_capital"]
             tot_profit = Trade.get_total_closed_profit()
@@ -351,7 +456,7 @@ class Wallets:
         """
 
         free = self.get_free(self._stake_currency)
-        return min(self.get_total_stake_amount() - Trade.total_open_trades_stakes(), free)
+        return min(self.get_total_stake_amount() - self._open_stakes(), free)
 
     def _calculate_unlimited_stake_amount(
         self, available_amount: float, val_tied_up: float, max_open_trades: IntOrInf
@@ -403,7 +508,7 @@ class Wallets:
         # Ensure wallets are up-to-date.
         if update:
             self.update()
-        val_tied_up = Trade.total_open_trades_stakes()
+        val_tied_up = self._open_stakes()
         available_amount = self.get_available_stake_amount()
 
         stake_amount = self._config["stake_amount"]
@@ -495,11 +600,7 @@ class Wallets:
             leverage = pos.leverage or 1.0
             if rate:
                 # Same formula than in rpc's _rpc_balance
-                total_quote = (
-                    rate * pos.position - pos.collateral * (leverage - 1)
-                    if pos.side == "long"
-                    else pos.collateral * (1 + leverage) - rate * pos.position
-                )
+                total_quote = pos.estimate_value(rate)
 
             position_record = WalletHistory(
                 timestamp=timestamp,
@@ -517,7 +618,7 @@ class Wallets:
             wallet_records.append(position_record)
 
         for wallet in self.get_all_balances().values():
-            if wallet.total == 0:
+            if wallet.total == 0 and wallet.free == 0:
                 continue
             rate = self._exchange.get_conversion_rate(wallet.currency, self._stake_currency)
             is_bot_managed = (

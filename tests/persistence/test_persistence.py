@@ -1468,6 +1468,10 @@ def test_to_json(fee):
         "is_short": None,
         "trading_mode": None,
         "funding_fees": None,
+        "funding_fee_running": None,
+        "funding_fee_processed": 0.0,
+        "funding_fee_margin": 0.0,
+        "funding_fee_last_timestamp": None,
         "amount_precision": 8.0,
         "price_precision": 7.0,
         "precision_mode": 1,
@@ -1561,6 +1565,10 @@ def test_to_json(fee):
         "is_short": None,
         "trading_mode": None,
         "funding_fees": None,
+        "funding_fee_running": None,
+        "funding_fee_processed": 0.0,
+        "funding_fee_margin": 0.0,
+        "funding_fee_last_timestamp": None,
         "amount_precision": 7.0,
         "price_precision": 8.0,
         "precision_mode": 2,
@@ -2271,6 +2279,8 @@ def test_Trade_object_idem():
         "bt_open_open_trade_count",
         "bt_total_profit",
         "from_json",
+        # Transient funding input is inherited; only its allocation state is persisted.
+        "_funding_fee_payments",
     )
 
     # Parent (LocalTrade) should have the same attributes

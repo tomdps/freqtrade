@@ -387,12 +387,14 @@ class FreqtradeBot(LoggingMixin):
         if self.trading_mode == TradingMode.FUTURES:
             trades: list[Trade] = Trade.get_open_trades()
             for trade in trades:
-                self._refresh_funding_fees(trade)
+                self._refresh_funding_fees(trade, update_wallet=False)
+            if self.exchange.get_option("funding_fee_continuous", False) is True:
+                self.wallets.update()
 
-    def _refresh_funding_fees(self, trade: Trade) -> None:
+    def _refresh_funding_fees(self, trade: Trade, update_wallet: bool = True) -> None:
         """Bring the funding of a trade up to now."""
         if self.exchange.get_option("funding_fee_continuous", False) is True:
-            self._update_continuous_funding(trade, datetime.now(UTC))
+            self._update_continuous_funding(trade, datetime.now(UTC), update_wallet=update_wallet)
             return
         trade.set_funding_fees(
             self.exchange.get_funding_fees(
@@ -404,7 +406,11 @@ class FreqtradeBot(LoggingMixin):
         )
 
     def _update_continuous_funding(
-        self, trade: Trade, end: datetime, exclude_order: str | None = None
+        self,
+        trade: Trade,
+        end: datetime,
+        exclude_order: str | None = None,
+        update_wallet: bool = True,
     ) -> bool:
         """
         Accrue the unchanged exposure since its last actual fill, before mutation.
@@ -418,13 +424,43 @@ class FreqtradeBot(LoggingMixin):
         )
         start = max((o.order_filled_utc for o in orders), default=end)
         try:
-            funding = self.exchange._fetch_and_calculate_funding_fees(
-                trade.pair, max(0.0, amount), trade.is_short, start, end
-            )
+            if self.wallets.uses_isolated_funding:
+                data, start = self.exchange._fetch_funding_and_mark(trade.pair, start)
+                funding = self.exchange.calculate_funding_fees(
+                    data, max(0.0, amount), trade.is_short, start, end
+                )
+                trade._funding_fee_payments = self.exchange.calculate_funding_payments(
+                    data,
+                    max(0.0, amount),
+                    trade.is_short,
+                    start,
+                    end,
+                    trade.funding_fee_last_time_utc,
+                )
+            else:
+                funding = self.exchange._fetch_and_calculate_funding_fees(
+                    trade.pair, max(0.0, amount), trade.is_short, start, end
+                )
         except TemporaryError as e:
             logger.warning(f"Funding of trade {trade.id} not updated, will retry: {e}")
             return False
+        previous_funding = trade.funding_fees
         trade.set_funding_fees(funding)
+        funding_changed = trade.funding_fees != previous_funding
+        if update_wallet:
+            self.wallets.update()
+        if (
+            funding_changed
+            and not self.config["dry_run"]
+            and self.margin_mode == MarginMode.ISOLATED
+        ):
+            update_liquidation_prices(
+                trade,
+                exchange=self.exchange,
+                wallets=self.wallets,
+                stake_currency=self.config["stake_currency"],
+                dry_run=False,
+            )
         return True
 
     def startup_backpopulate_precision(self) -> None:

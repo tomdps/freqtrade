@@ -1,9 +1,15 @@
 # Kraken continuous funding
 
 This fork starts from Freqtrade 2026.8. The local package version
-`2026.8+kraken.7` identifies its funding and native fill corrections. The patch
+`2026.8+kraken.9` identifies its funding and native fill corrections. The patch
 targets backtesting and dry-run accounting; it has not been reconciled against
 a live account ledger.
+
+This line also carries upstream security fixes for nested credential and token
+redaction, nested dry-run credential removal, API signing-secret redaction and
+Telegram manual-button authorization. It requires certifi 2026.10.19 and filelock
+4.2.1 or newer. CCXT 4.5.90 permits the corrected certificate bundle. Explicit
+sensitive output remains available; unset values remain unset.
 
 Kraken's linear perpetual contracts accrue funding continuously. Each hourly
 rate applies from its timestamp until the next hour, and only the time actually

@@ -1570,6 +1570,35 @@ async def test_forceexit_handle_invalid(default_conf, update, mocker) -> None:
     assert "invalid argument" in msg_mock.call_args_list[0][0][0]
 
 
+@pytest.mark.parametrize(
+    "handler,callback_data,action",
+    [
+        ("_force_enter_inline", "force_enter__COIN/USDT_||_long", "_force_enter_action"),
+        ("_force_exit_inline", "force_exit__1", "_force_exit_action"),
+    ],
+)
+async def test_force_inline_rejects_unauthorized_user(
+    default_conf, mocker, caplog, handler, callback_data, action
+) -> None:
+    default_conf["telegram"]["authorized_users"] = ["1234"]
+    telegram, _, _ = get_telegram_testobject(mocker, default_conf)
+    action_mock = mocker.patch.object(telegram, action, new_callable=AsyncMock)
+    mocker.patch(
+        "freqtrade.rpc.telegram.Trade.get_trades"
+    ).return_value.first.return_value = MagicMock(pair="COIN/USDT")
+    update = MagicMock()
+    update.effective_user.id = 5432
+    update.callback_query = AsyncMock()
+    update.callback_query.message.chat_id = int(default_conf["telegram"]["chat_id"])
+    update.callback_query.message.message_thread_id = None
+    update.callback_query.data = callback_data
+
+    await getattr(telegram, handler)(update, None)
+
+    action_mock.assert_not_awaited()
+    assert log_has("Unauthorized user tried to control the bot: 5432", caplog)
+
+
 async def test_force_exit_no_pair(default_conf, update, ticker, fee, mocker) -> None:
     default_conf["max_open_trades"] = 4
     mocker.patch.multiple(
@@ -1604,6 +1633,7 @@ async def test_force_exit_no_pair(default_conf, update, ticker, fee, mocker) -> 
     assert keyboard[1][0].callback_data == "force_exit__2 "
     update = MagicMock()
     update.callback_query = AsyncMock()
+    update.callback_query.message.chat_id = 1235
     update.callback_query.data = keyboard[1][0].callback_data
     await telegram._force_exit_inline(update, None)
     assert update.callback_query.answer.call_count == 1
@@ -1684,12 +1714,14 @@ async def test_force_enter_no_pair(default_conf, update, mocker) -> None:
     assert reduce(lambda acc, x: acc + len(x), keyboard, 0) == 5
     update = MagicMock()
     update.callback_query = AsyncMock()
+    update.callback_query.message.chat_id = 1235
     update.callback_query.data = "force_enter__XRP/USDT_||_long"
     await telegram._force_enter_inline(update, None)
     assert fbuy_mock.call_count == 1
 
     fbuy_mock.reset_mock()
     update.callback_query = AsyncMock()
+    update.callback_query.message.chat_id = 1235
     update.callback_query.data = "force_enter__cancel"
     await telegram._force_enter_inline(update, None)
     assert fbuy_mock.call_count == 0

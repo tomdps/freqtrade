@@ -48,4 +48,5 @@ jobs:
             tests/freqtradebot \
             tests/test_wallets.py tests/test_candle_columns.py tests/persistence/test_persistence.py \
             tests/persistence/test_migrations.py tests/persistence/test_trade_fromjson.py \
-            tests/rpc/test_rpc.py::test_rpc_trade_status tests/rpc/test_rpc.py::test_rpc_balance_futures
+            tests/rpc/test_rpc.py::test_rpc_trade_status tests/rpc/test_rpc.py::test_rpc_balance_futures \
+            tests/test_configuration.py tests/rpc/test_rpc_telegram.py

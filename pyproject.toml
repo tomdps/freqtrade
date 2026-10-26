@@ -30,7 +30,7 @@ classifiers = [
 
 dependencies = [
   # from requirements.txt
-  "ccxt>=4.5.76",
+  "ccxt>=4.5.90",
   "SQLAlchemy>=2.0.6",
   "python-telegram-bot>=20.1",
   "humanize>=4.0.0",
@@ -38,7 +38,7 @@ dependencies = [
   "requests",
   "httpx>=0.24.1",
   "urllib3",
-  "certifi>=2026.1.4",
+  "certifi>=2026.10.19",
   "jsonschema",
   "scipy",
   "numpy>2.0,<3.0",
@@ -83,7 +83,7 @@ dependencies = [
 plot = ["plotly>=4.0"]
 hyperopt = [
   "cmaes",
-  "filelock",
+  "filelock>=4.2.1",
   "optuna > 4.0.0",
   "scikit-learn",
 ]
@@ -233,6 +233,8 @@ exclude-newer = "1 week"
 [tool.uv.exclude-newer-package]
 ccxt = false
 virtualenv = "5 days"
+certifi = "2 days"
+filelock = "2 days"
 
 [tool.ruff]
 line-length = 100

@@ -1,7 +1,7 @@
 # Kraken continuous funding
 
 This fork starts from Freqtrade 2026.8. The local package version
-`2026.8+kraken.10` identifies its funding and native fill corrections. The patch
+`2026.8+kraken.11` identifies its funding and native fill corrections. The patch
 targets backtesting and dry-run accounting; it has not been reconciled against
 a live account ledger.
 
@@ -52,8 +52,18 @@ that fills in that window keeps its fill time, price and fee, and is booked once
 the funding up to its fill is known, usually one loop later. Until then it stays
 open, and a later exit or added entry does not replace it. If a pair's history
 stays unavailable, its funding and bookings keep waiting, with a warning on every
-loop. A gap inside the published history still stops the bot, and backtests still
-refuse any history that does not cover a holding.
+loop.
+
+A missing hour inside otherwise newer public history no longer stops position management.
+The bot books observed funding only, saves the missing hours on the trade, and exposes
+`funding_fees_pending` through its API. Profits and available simulated balance are provisional
+while that flag is set: no rate is inferred for missing time. Fills retain their actual times,
+prices and fees and are booked without waiting for a permanent gap to disappear. The bot retries
+public funding history at least once a minute, including for closed trades with pending funding.
+When the observations arrive it recalculates each actual exposure interval and corrects funding,
+realized profit and the wallet without duplicating an order or a charge. The saved missing-hour
+list survives a restart. Duplicate, unaligned or invalid observations remain errors. Historical
+backtests still refuse any history that does not cover a holding.
 
 Backtests ask for each open trade's funding at every candle, and at every detail
 candle with `--timeframe-detail`. The calculator prepares each funding frame once

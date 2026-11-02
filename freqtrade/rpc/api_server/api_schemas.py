@@ -355,6 +355,7 @@ class TradeSchema(BaseModel):
     interest_rate: float | None = None
     liquidation_price: float | None = None
     funding_fees: float | None = None
+    funding_fees_pending: bool = False
     trading_mode: TradingMode | None = None
 
     amount_precision: float | None = None

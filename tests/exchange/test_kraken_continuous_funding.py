@@ -9,7 +9,7 @@ import pytest
 from freqtrade.data.converter import ohlcv_to_dataframe
 from freqtrade.data.history.datahandlers import get_datahandler
 from freqtrade.enums import CandleType
-from freqtrade.exceptions import OperationalException, TemporaryError
+from freqtrade.exceptions import FundingGapError, OperationalException, TemporaryError
 from freqtrade.util import dt_utc
 from tests.conftest import get_patched_exchange
 
@@ -199,8 +199,7 @@ def test_hourly_cache_does_not_refetch_on_each_poll(mocker, default_conf):
 def test_rate_not_yet_published_or_unreachable_is_temporary(mocker, default_conf):
     """Kraken publishes each hour's rate just after the hour starts, and can be unreachable.
 
-    A running bot asking for funding up to now must be able to retry later. A hole inside the
-    published history stays an error, like in backtests.
+    A running bot can retry late rates and report known payments across an internal gap.
     """
     ex = get_patched_exchange(mocker, default_conf, exchange="krakenfutures")
     key = (PAIR, "1h", CandleType.FUNDING_RATE)
@@ -220,7 +219,7 @@ def test_rate_not_yet_published_or_unreachable_is_temporary(mocker, default_conf
         10 * (0.01 - 0.02 + 0.03 * 0.8 / 3600)
     )
     fetch.return_value = {key: rates().drop(index=1)}
-    with pytest.raises(OperationalException, match="gap"):
+    with pytest.raises(FundingGapError, match="incomplete"):
         ex._fetch_and_calculate_funding_fees(
             PAIR, 10, True, START, START + timedelta(hours=3, minutes=30)
         )
@@ -265,3 +264,39 @@ def test_absolute_converter_does_not_floor_or_hide_invalid_rates(problem):
             fill_missing=False,
             drop_incomplete=False,
         )
+
+
+@pytest.mark.parametrize("short", [False, True])
+def test_live_gap_reports_observed_payment_and_refetches(mocker, default_conf, short):
+    ex = get_patched_exchange(mocker, default_conf, exchange="krakenfutures")
+    key = (PAIR, "1h", CandleType.FUNDING_RATE)
+    frame = rates().drop(index=1)
+    fetch = mocker.patch.object(ex, "refresh_latest_ohlcv", return_value={key: frame})
+    end = START + timedelta(hours=3)
+    with pytest.raises(FundingGapError) as caught:
+        ex._fetch_and_calculate_funding_fees(PAIR, 10, short, START, end)
+    assert caught.value.known_funding == pytest.approx(0.4 if short else -0.4)
+    assert caught.value.missing_hours == [(START + timedelta(hours=1)).isoformat()]
+    with pytest.raises(OperationalException, match="gap or duplicate"):
+        ex.calculate_funding_fees(frame, 10, short, START, end)
+    ex._funding_rate_cache.clear()  # simulate the retry cache expiring
+    fetch.return_value = {key: rates()}
+    assert ex._fetch_and_calculate_funding_fees(PAIR, 10, short, START, end) == pytest.approx(
+        0.2 if short else -0.2
+    )
+
+
+@pytest.mark.parametrize("problem", ["duplicate", "unaligned", "nan"])
+def test_live_gap_does_not_accept_invalid_observations(mocker, default_conf, problem):
+    ex = get_patched_exchange(mocker, default_conf, exchange="krakenfutures")
+    frame = rates().drop(index=1)
+    if problem == "duplicate":
+        frame = pd.concat([frame, frame.iloc[[1]]])
+    elif problem == "unaligned":
+        frame.loc[2, "date"] += timedelta(minutes=1)
+    else:
+        frame.loc[2, "funding_rate_absolute"] = float("nan")
+    key = (PAIR, "1h", CandleType.FUNDING_RATE)
+    mocker.patch.object(ex, "refresh_latest_ohlcv", return_value={key: frame})
+    with pytest.raises(OperationalException, match="invalid hours or rates"):
+        ex._fetch_and_calculate_funding_fees(PAIR, 10, False, START, START + timedelta(hours=3))

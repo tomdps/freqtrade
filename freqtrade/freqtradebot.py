@@ -30,6 +30,7 @@ from freqtrade.enums import (
 from freqtrade.exceptions import (
     DependencyException,
     ExchangeError,
+    FundingGapError,
     InsufficientFundsError,
     InvalidOrderException,
     OperationalException,
@@ -386,6 +387,8 @@ class FreqtradeBot(LoggingMixin):
     def update_funding_fees(self) -> None:
         if self.trading_mode == TradingMode.FUTURES:
             trades: list[Trade] = Trade.get_open_trades()
+            if self.exchange.id == "krakenfutures":
+                trades += Trade.get_closed_trades_with_pending_funding()
             for trade in trades:
                 self._refresh_funding_fees(trade, update_wallet=False)
             if self.exchange.get_option("funding_fee_continuous", False) is True:
@@ -417,6 +420,10 @@ class FreqtradeBot(LoggingMixin):
         :return: False if the exchange cannot provide the rates up to `end` yet. The funding is
             then left as it was, for a later loop to retry.
         """
+        if trade.funding_fees_pending:
+            if not self.config["dry_run"]:
+                raise OperationalException("Cannot reconcile missing live funding observations.")
+            return self._update_pending_funding(trade, end, exclude_order, update_wallet)
         orders = [o for o in trade.select_filled_orders() if o.order_id != exclude_order]
         amount = sum(
             o.safe_amount_after_fee * (1 if o.ft_order_side == trade.entry_side else -1)
@@ -441,6 +448,14 @@ class FreqtradeBot(LoggingMixin):
                 funding = self.exchange._fetch_and_calculate_funding_fees(
                     trade.pair, max(0.0, amount), trade.is_short, start, end
                 )
+        except FundingGapError as e:
+            if not self.config["dry_run"]:
+                raise OperationalException(
+                    "Cannot reconcile missing live funding observations."
+                ) from e
+            funding = e.known_funding
+            trade.set_pending_funding(e.missing_hours)
+            self.log_once(f"Trade {trade.id}: {e}. Profit is provisional.", logger.warning)
         except TemporaryError as e:
             logger.warning(f"Funding of trade {trade.id} not updated, will retry: {e}")
             return False
@@ -461,6 +476,57 @@ class FreqtradeBot(LoggingMixin):
                 stake_currency=self.config["stake_currency"],
                 dry_run=False,
             )
+        return True
+
+    def _update_pending_funding(
+        self, trade: Trade, end: datetime, exclude_order: str | None, update_wallet: bool
+    ) -> bool:
+        """Reprice observed order intervals, including closed trades, until missing rates arrive."""
+        orders = [o for o in trade.select_filled_orders() if o.order_id != exclude_order]
+        amount, running = 0.0, 0.0
+        start = orders[0].order_filled_utc if orders else end
+        fees, missing = [], set()
+
+        def payment(stop: datetime) -> float:
+            try:
+                return self.exchange._fetch_and_calculate_funding_fees(
+                    trade.pair, max(0.0, amount), trade.is_short, start, stop
+                )
+            except FundingGapError as error:
+                missing.update(error.missing_hours)
+                return error.known_funding
+
+        try:
+            for order in orders:
+                fees.append(payment(order.order_filled_utc))
+                amount += order.safe_amount_after_fee * (
+                    1 if order.ft_order_side == trade.entry_side else -1
+                )
+                start = order.order_filled_utc
+            if trade.is_open:
+                running = payment(end)
+        except TemporaryError as error:
+            self.log_once(
+                f"Trade {trade.id}: pending funding still unavailable: {error}", logger.warning
+            )
+            return False
+        for order, funding in zip(orders, fees, strict=True):
+            order.funding_fee = funding
+        trade.recalc_trade_from_orders(is_closing=not trade.is_open)
+        trade.set_funding_fees(running)
+        hours = sorted(missing)
+        if trade.pending_funding_hours != hours:
+            trade.set_pending_funding(hours)
+        if not trade.is_open:
+            Trade.session.flush()  # the wallet's closed-profit sum reads the database
+        if hours:
+            self.log_once(
+                f"Trade {trade.id}: funding is incomplete for {', '.join(hours)}; "
+                "profit is provisional.",
+                logger.warning,
+            )
+        if update_wallet:
+            self.wallets.update()
         return True
 
     def startup_backpopulate_precision(self) -> None:

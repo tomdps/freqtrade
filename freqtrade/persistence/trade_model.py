@@ -2,6 +2,7 @@
 This module contains the class to persist trades into SQLite
 """
 
+import json
 import logging
 from collections import defaultdict
 from collections.abc import Sequence
@@ -782,6 +783,7 @@ class LocalTrade:
             "is_short": self.is_short,
             "trading_mode": self.trading_mode,
             "funding_fees": self.funding_fees,
+            **({"funding_fees_pending": True} if self.funding_fees_pending else {}),
             "funding_fee_running": self.funding_fee_running,
             "funding_fee_processed": self.funding_fee_processed,
             "funding_fee_margin": self.funding_fee_margin,
@@ -1617,6 +1619,48 @@ class LocalTrade:
         Retrieve open trades
         """
         return Trade.get_trades_proxy(is_open=True)
+
+    @property
+    def pending_funding_hours(self) -> list[str]:
+        if self.exchange != "krakenfutures" or not Trade.use_db:
+            return []
+        value = Trade.session.scalar(
+            select(_CustomData.cd_value).where(
+                _CustomData.ft_trade_id == self.id, _CustomData.cd_key == "funding_pending"
+            )
+        )
+        return json.loads(value) if value else []
+
+    @property
+    def funding_fees_pending(self) -> bool:
+        return bool(self.pending_funding_hours)
+
+    def set_pending_funding(self, hours: list[str]) -> None:
+        """Save missing hours in the same transaction as their funding and profit correction."""
+        entry = Trade.session.scalar(
+            select(_CustomData).where(
+                _CustomData.ft_trade_id == self.id, _CustomData.cd_key == "funding_pending"
+            )
+        )
+        if entry is None:
+            entry = _CustomData(ft_trade_id=self.id, cd_key="funding_pending", cd_type="list")
+            Trade.session.add(entry)
+        entry.cd_value = json.dumps(hours)
+        Trade.session.flush()
+
+    @staticmethod
+    def get_closed_trades_with_pending_funding() -> list["Trade"]:
+        return list(
+            Trade.session.scalars(
+                select(Trade)
+                .join(_CustomData)
+                .where(
+                    Trade.is_open.is_(False),
+                    _CustomData.cd_key == "funding_pending",
+                    _CustomData.cd_value != "[]",
+                )
+            )
+        )
 
     @staticmethod
     def get_open_trade_count() -> int:

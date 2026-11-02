@@ -70,6 +70,15 @@ class TemporaryError(ExchangeError):
     """
 
 
+class FundingGapError(TemporaryError):
+    """Observed funding is known, but the listed hours still have no published rate."""
+
+    def __init__(self, known_funding: float, missing_hours: list[str]):
+        self.known_funding = known_funding
+        self.missing_hours = missing_hours
+        super().__init__(f"Funding is incomplete; missing hours: {', '.join(missing_hours)}")
+
+
 class DDosProtection(TemporaryError):
     """
     Temporary error caused by DDOS protection.

@@ -1,7 +1,7 @@
 # Kraken continuous funding
 
 This fork starts from Freqtrade 2026.9. The local package version
-`2026.9+kraken.5` identifies its Kraken funding correction. The patch targets
+`2026.9+kraken.6` identifies its Kraken funding correction. The patch targets
 backtesting and dry-run accounting; it has not been reconciled against a live
 account ledger.
 
@@ -20,6 +20,12 @@ following upstream's security updates. CCXT 4.5.90 allows the corrected
 certificate bundle, which the previous client pinned to an affected version.
 Explicit sensitive-output behavior is
 unchanged, and unset values stay unset.
+
+The HTTP client requires aiohttp 3.14.4 or newer to keep shared cookies marked
+Secure off unencrypted requests, including after a cached HTTPS request.
+See the [aiohttp security advisory](https://github.com/aio-libs/aiohttp/security/advisories/GHSA-494j-54xm-rwp3).
+An offline synthetic regression checks this dependency behavior without opening
+a network connection.
 
 Kraken's linear perpetual contracts accrue funding continuously. Each hourly
 rate applies from its timestamp until the next hour, and only the time actually

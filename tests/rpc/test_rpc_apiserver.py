@@ -1710,6 +1710,7 @@ def test_api_status(
         "interest_rate": 0.0,
         "liquidation_price": None,
         "funding_fees": None,
+        "funding_fees_pending": False,
         "trading_mode": ANY,
         "amount_precision": None,
         "price_precision": None,

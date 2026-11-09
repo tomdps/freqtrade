@@ -4,6 +4,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 from functools import cached_property
 from math import isfinite
+from time import monotonic
 from typing import Any
 
 import ccxt
@@ -13,6 +14,7 @@ from pandas import DataFrame, DatetimeIndex, Timestamp
 from freqtrade.enums import CandleType, MarginMode, PriceType, TradingMode
 from freqtrade.exceptions import (
     DDosProtection,
+    FundingGapError,
     InvalidOrderException,
     OperationalException,
     TemporaryError,
@@ -389,17 +391,29 @@ class Krakenfutures(Exchange):
         briefly unreachable. A history that cannot be fetched, or does not reach close_date yet,
         raises TemporaryError so that a running bot can retry later. refresh_latest_ohlcv skips a
         pair whose response fails to load, so this includes a response with invalid rows. Any
-        problem in a fetched history, such as a gap, is an OperationalException, as in backtests.
+        gap inside a fetched history returns the observed payments in FundingGapError, with
+        missing hours explicitly listed. The strict historical calculator remains unchanged.
         """
         close_date = close_date or datetime.now(UTC)
         if not amount or close_date == open_date:
             return 0.0
         key = (pair, "1h", CandleType.FUNDING_RATE)
         cache = getattr(self, "_funding_rate_cache", {})
-        rates = cache.get(pair)
+        rates, retry_at = cache.get(pair, (None, None))
         first = Timestamp(open_date).floor("h")
         last = (Timestamp(close_date) - timedelta(microseconds=1)).floor("h")
-        if rates is None or rates.empty or rates.date.min() > first or rates.date.max() < last:
+        now = monotonic()
+        retry_due = retry_at is not None and now >= retry_at
+        if retry_due:
+            # Keep known rates available if this retry fails, without polling on every loop.
+            cache[pair] = (rates, now + 60)
+        if (
+            retry_due
+            or rates is None
+            or rates.empty
+            or rates.date.min() > first
+            or rates.date.max() < last
+        ):
             histories = self.refresh_latest_ohlcv(
                 [key],
                 since_ms=int(first.timestamp() * 1000),
@@ -413,9 +427,24 @@ class Krakenfutures(Exchange):
                 raise TemporaryError(
                     f"Kraken has not yet published the {last} funding rate for {pair}."
                 )
-            cache[pair] = rates
+            retry_at = None
+            cache[pair] = (rates, retry_at)
             self._funding_rate_cache = cache
-        return self.calculate_funding_fees(rates, amount, is_short, open_date, close_date)
+        if not self._config["dry_run"]:
+            return self.calculate_funding_fees(rates, amount, is_short, open_date, close_date)
+        if close_date < open_date or amount < 0 or not isfinite(amount):
+            raise OperationalException("Invalid Kraken funding holding interval or amount.")
+        if "funding_rate_absolute" not in rates:
+            raise OperationalException("Kraken funding history needs absolute rates.")
+        payment, missing = self._funding_table(rates).observed_payment(
+            amount, Timestamp(open_date).value, Timestamp(close_date).value
+        )
+        funding = payment if is_short else -payment
+        if missing:
+            if retry_at is None:
+                cache[pair] = (rates, now + 60)
+            raise FundingGapError(funding, missing)
+        return funding
 
     def get_funding_fees(self, pair: str, amount: float, is_short: bool, open_date) -> float:
         """Calculate continuous funding; never replace missing payments with zero."""
@@ -474,6 +503,26 @@ class _FundingTable:
             self.sums.clear()
         self.sums[amount, first] = (full, total)
         return self._add(total, amount, first, last, full, hi)
+
+    def observed_payment(self, amount: float, first: int, last: int) -> tuple[float, list[str]]:
+        """Dry-run can retain known payments while identifying every unknown hour."""
+        try:
+            return self.payment(amount, first, last), []
+        except OperationalException:
+            pass
+        start = first - first % _HOUR
+        lo = int(np.searchsorted(self.dates, start, "left"))
+        hi = int(np.searchsorted(self.dates, last, "left"))
+        dates = self.dates[lo:hi]
+        if (
+            self.misaligned[hi] != self.misaligned[lo]
+            or np.any(np.diff(dates) <= 0)
+            or self.missing[hi] != self.missing[lo]
+        ):
+            raise OperationalException("Kraken funding history has invalid hours or rates.")
+        missing = np.setdiff1d(np.arange(start, last, _HOUR), dates)
+        hours = [Timestamp(int(hour), tz="UTC").isoformat() for hour in missing]
+        return self._add(0.0, amount, first, last, lo, hi), hours
 
     def _add(self, total: float, amount: float, first: int, last: int, lo: int, hi: int) -> float:
         """Add hours lo..hi-1 to a running total, one by one in time order."""

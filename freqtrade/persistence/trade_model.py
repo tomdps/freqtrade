@@ -2,6 +2,7 @@
 This module contains the class to persist trades into SQLite
 """
 
+import json
 import logging
 from collections import defaultdict
 from collections.abc import Sequence
@@ -52,6 +53,7 @@ from freqtrade.util import FtPrecise, dt_from_ts, dt_now, dt_ts, dt_ts_none, rou
 
 
 logger = logging.getLogger(__name__)
+_KRAKEN_FUNDING_PENDING = "freqtrade:kraken-funding-pending"
 
 
 @dataclass
@@ -776,6 +778,7 @@ class LocalTrade:
             "is_short": self.is_short,
             "trading_mode": self.trading_mode,
             "funding_fees": self.funding_fees,
+            **({"funding_fees_pending": True} if self.funding_fees_pending else {}),
             "amount_precision": self.amount_precision,
             "price_precision": self.price_precision,
             "precision_mode": self.precision_mode,
@@ -1608,6 +1611,54 @@ class LocalTrade:
         Retrieve open trades
         """
         return Trade.get_trades_proxy(is_open=True)
+
+    @property
+    def pending_funding_hours(self) -> list[str]:
+        if self.exchange != "krakenfutures" or not Trade.use_db:
+            return []
+        value = Trade.session.scalar(
+            select(_CustomData.cd_value).where(
+                _CustomData.ft_trade_id == self.id,
+                _CustomData.cd_key == _KRAKEN_FUNDING_PENDING,
+                _CustomData.cd_type == "list",
+            )
+        )
+        return json.loads(value) if value else []
+
+    @property
+    def funding_fees_pending(self) -> bool:
+        return bool(self.pending_funding_hours)
+
+    def set_pending_funding(self, hours: list[str]) -> None:
+        """Save missing hours in the same transaction as their funding and profit correction."""
+        entry = Trade.session.scalar(
+            select(_CustomData).where(
+                _CustomData.ft_trade_id == self.id,
+                _CustomData.cd_key == _KRAKEN_FUNDING_PENDING,
+            )
+        )
+        if entry is None:
+            entry = _CustomData(ft_trade_id=self.id, cd_key=_KRAKEN_FUNDING_PENDING)
+            Trade.session.add(entry)
+        entry.cd_type = "list"
+        entry.cd_value = json.dumps(hours)
+        Trade.session.flush()
+
+    @staticmethod
+    def get_closed_trades_with_pending_funding() -> list["Trade"]:
+        return list(
+            Trade.session.scalars(
+                select(Trade)
+                .join(_CustomData)
+                .where(
+                    Trade.is_open.is_(False),
+                    Trade.exchange == "krakenfutures",
+                    _CustomData.cd_key == _KRAKEN_FUNDING_PENDING,
+                    _CustomData.cd_type == "list",
+                    _CustomData.cd_value != "[]",
+                )
+            )
+        )
 
     @staticmethod
     def get_open_trade_count() -> int:

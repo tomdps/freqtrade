@@ -1,7 +1,7 @@
 # Kraken continuous funding
 
 This fork starts from Freqtrade 2026.9. The local package version
-`2026.9+kraken.6` identifies its Kraken funding correction. The patch targets
+`2026.9+kraken.7` identifies its Kraken funding correction. The patch targets
 backtesting and dry-run accounting; it has not been reconciled against a live
 account ledger.
 
@@ -60,8 +60,15 @@ that fills in that window keeps its fill time, price and fee, and is booked once
 the funding up to its fill is known, usually one loop later. Until then it stays
 open, and a later exit or added entry does not replace it. If a pair's history
 stays unavailable, its funding and bookings keep waiting, with a warning on every
-loop. A gap inside the published history still stops the bot, and backtests still
-refuse any history that does not cover a holding.
+loop.
+
+Dry-run bots can manage positions across a missing hour inside published history.
+They book observed payments and save the missing hours on each trade. The API
+sets `funding_fees_pending` while profit and available simulated balance are
+provisional. A shorter history response leaves booked funding in place while the
+bot retries. When the rates arrive, it corrects open and closed trades using each
+filled order's time and exposure. The missing-hour list survives a restart.
+Backtests and live trading still require complete valid history.
 
 Cancelling an unfilled stop leaves accrued funding on the open position, even
 when the response omits the filled quantity or the next rate is not available.

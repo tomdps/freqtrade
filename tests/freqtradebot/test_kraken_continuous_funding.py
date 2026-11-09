@@ -516,3 +516,97 @@ def test_dry_stop_on_exchange_waiting_for_funding_sends_one_fill_message(
     assert not trade.is_open
     assert stop.funding_fee == pytest.approx(-0.1 * (2 + 0.5 / 3600))
     assert len(fill_messages()) == 1
+
+
+@pytest.mark.parametrize("short", [False, True])
+@pytest.mark.parametrize("action", ["close", "reduce", "add"])
+def test_dry_gap_keeps_fills_and_corrects_open_and_closed_funding_after_restart(
+    mocker, default_conf_usdt, time_machine, short, action
+):
+    time_machine.move_to(START, tick=False)
+    bot = make_bot(mocker, default_conf_usdt)
+    exit_positions = stub_strategy_steps(mocker, bot)
+    assert bot.execute_entry(PAIR, 1000, ordertype="market", is_short=short)
+    trade = Trade.session.scalars(select(Trade)).one()
+    bot.exchange.refresh_latest_ohlcv.return_value = {FUNDING: history(4).drop(index=1)}
+    time_machine.move_to(START + timedelta(hours=2, minutes=30), tick=False)
+    bot.process()
+    sign = 1 if short else -1
+    assert exit_positions.called
+    assert trade.funding_fees == pytest.approx(sign * 0.15)
+    assert trade.funding_fees_pending
+    assert trade.to_json()["funding_fees_pending"] is True
+
+    if action == "add":
+        assert bot.execute_entry(PAIR, 1000, trade=trade, ordertype="market", is_short=short)
+        assert trade.amount == 20
+    else:
+        amount = 4 if action == "reduce" else None
+        assert bot.execute_trade_exit(
+            trade,
+            100,
+            ExitCheckTuple(ExitType.EXIT_SIGNAL),
+            ordertype="market",
+            sub_trade_amt=amount,
+        )
+        assert trade.is_open == (action == "reduce")
+    assert not trade.orders[-1].ft_is_open
+    assert trade.orders[-1].funding_fee == pytest.approx(sign * 0.15)
+    filled_at = trade.orders[-1].order_filled_utc
+    Trade.commit()
+    Trade.session.expire_all()
+    bot.exchange._dry_run_open_orders.clear()
+    bot.exchange._funding_rate_cache.clear()
+    time_machine.move_to(START + timedelta(hours=3, minutes=30), tick=False)
+    bot.exchange.refresh_latest_ohlcv.return_value = {FUNDING: history(4)}
+    bot.update_funding_fees()
+    bot.wallets.update()
+    expected = {"close": 0.25, "reduce": 0.31, "add": 0.45}[action] * sign
+    assert not trade.funding_fees_pending
+    assert trade.funding_fees == pytest.approx(expected)
+    assert trade.orders[-1].funding_fee == pytest.approx(sign * 0.25)
+    assert trade.orders[-1].order_filled_utc == filled_at
+    if action == "close":
+        assert trade.realized_profit == pytest.approx(expected)
+    assert bot.wallets.get_total("USDT") == pytest.approx(10000 + expected)
+    bot.update_funding_fees()
+    bot.wallets.update()
+    assert bot.wallets.get_total("USDT") == pytest.approx(10000 + expected)
+
+
+def test_dry_gap_backfill_rolls_back_with_its_pending_flag(mocker, default_conf_usdt, time_machine):
+    time_machine.move_to(START, tick=False)
+    bot = make_bot(mocker, default_conf_usdt)
+    assert bot.execute_entry(PAIR, 1000, ordertype="market")
+    trade = Trade.session.scalars(select(Trade)).one()
+    trade.set_custom_data("funding_pending", "strategy note")
+    bot.exchange.refresh_latest_ohlcv.return_value = {FUNDING: history(4).drop(index=1)}
+    time_machine.move_to(START + timedelta(hours=2, minutes=30), tick=False)
+    assert bot.execute_trade_exit(
+        trade, 100, ExitCheckTuple(ExitType.EXIT_SIGNAL), ordertype="market"
+    )
+    assert trade.funding_fees_pending
+    pending = trade.pending_funding_hours
+    bot.exchange._funding_rate_cache.clear()
+    bot.exchange.refresh_latest_ohlcv.return_value = {FUNDING: history(4).drop(index=0)}
+    bot.update_funding_fees()
+    bot.wallets.update()
+    assert trade.pending_funding_hours == pending
+    assert trade.funding_fees == pytest.approx(-0.15)
+    assert bot.wallets.get_total("USDT") == pytest.approx(9999.85)
+    assert trade.get_custom_data("funding_pending") == "strategy note"
+
+    bot.exchange._funding_rate_cache.clear()
+    bot.exchange.refresh_latest_ohlcv.return_value = {FUNDING: history(4)}
+    bot.update_funding_fees()
+    bot.wallets.update()
+    assert not trade.funding_fees_pending
+    Trade.session.rollback()  # a crash before the next native commit
+    assert trade.funding_fees_pending
+    assert trade.funding_fees == pytest.approx(-0.15)
+    bot.update_funding_fees()
+    bot.wallets.update()
+    Trade.commit()
+    Trade.session.expire_all()
+    assert not trade.funding_fees_pending
+    assert Trade.get_total_closed_profit() == pytest.approx(-0.25)

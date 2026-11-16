@@ -10,6 +10,7 @@ from freqtrade.configuration import TimeRange
 from freqtrade.data.dataprovider import DataProvider
 from freqtrade.exceptions import OperationalException
 from freqtrade.freqai.data_kitchen import FreqaiDataKitchen
+from freqtrade.freqai.freqai_interface import IFreqaiModel
 from tests.conftest import get_patched_exchange, is_mac
 from tests.freqai.conftest import (
     get_patched_data_kitchen,
@@ -106,6 +107,17 @@ def test_make_train_test_datasets(mocker, freqai_conf):
     assert len(data_dictionary["train_features"].index) == 1916
 
 
+def test_model_setup_creates_valid_model_directory(freqai_conf):
+    model = MagicMock()
+    model.config = freqai_conf
+    IFreqaiModel.set_full_path(model)
+    assert (
+        model.full_path
+        == freqai_conf["user_data_dir"] / "models" / freqai_conf["freqai"]["identifier"]
+    )
+    assert model.full_path.is_dir()
+
+
 @pytest.mark.parametrize("model", ["LightGBMRegressor"])
 def test_get_full_model_path(mocker, freqai_conf, model):
     freqai_conf.update({"freqaimodel": model})
@@ -155,11 +167,11 @@ def test_get_full_models_path_stays_within_user_data(freqai_conf, identifier, va
     models_dir = Path(freqai_conf["user_data_dir"]) / "models"
 
     if valid:
-        path = FreqaiDataKitchen.get_full_models_path(None, freqai_conf)
+        path = FreqaiDataKitchen.get_full_models_path(freqai_conf)
         assert path.resolve().is_relative_to(models_dir.resolve())
     else:
         with pytest.raises(OperationalException, match="Invalid freqai identifier"):
-            FreqaiDataKitchen.get_full_models_path(None, freqai_conf)
+            FreqaiDataKitchen.get_full_models_path(freqai_conf)
 
 
 def test_get_pair_data_for_features_with_prealoaded_data(mocker, freqai_conf):

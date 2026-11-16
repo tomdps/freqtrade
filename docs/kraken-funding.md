@@ -1,7 +1,7 @@
 # Kraken continuous funding
 
 This fork starts from Freqtrade 2026.8. The local package version
-`2026.8+kraken.11` identifies its funding and native fill corrections. The patch
+`2026.8+kraken.12` identifies its funding and native fill corrections. The patch
 targets backtesting and dry-run accounting; it has not been reconciled against
 a live account ledger.
 
@@ -16,6 +16,11 @@ Secure off unencrypted requests, including after a cached HTTPS request.
 See the [aiohttp security advisory](https://github.com/aio-libs/aiohttp/security/advisories/GHSA-494j-54xm-rwp3).
 An offline synthetic regression checks this dependency behavior without opening
 a network connection.
+
+This release also follows upstream's local file restrictions. A RemotePairList's
+list of trading pairs can read and write local files within the user-data directory.
+FreqAI creates model directories below the models directory using its existing
+path check.
 
 Kraken's linear perpetual contracts accrue funding continuously. Each hourly
 rate applies from its timestamp until the next hour, and only the time actually

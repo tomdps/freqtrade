@@ -10,6 +10,7 @@ from freqtrade.configuration import TimeRange
 from freqtrade.data.dataprovider import DataProvider
 from freqtrade.exceptions import OperationalException
 from freqtrade.freqai.data_kitchen import FreqaiDataKitchen
+from freqtrade.freqai.freqai_interface import IFreqaiModel
 from tests.conftest import get_patched_exchange, is_mac
 from tests.freqai.conftest import (
     get_patched_data_kitchen,
@@ -104,6 +105,17 @@ def test_make_train_test_datasets(mocker, freqai_conf):
     assert data_dictionary
     assert len(data_dictionary) == 7
     assert len(data_dictionary["train_features"].index) == 1916
+
+
+def test_model_setup_creates_valid_model_directory(freqai_conf):
+    model = MagicMock()
+    model.config = freqai_conf
+    IFreqaiModel.set_full_path(model)
+    assert (
+        model.full_path
+        == freqai_conf["user_data_dir"] / "models" / freqai_conf["freqai"]["identifier"]
+    )
+    assert model.full_path.is_dir()
 
 
 @pytest.mark.parametrize("model", ["LightGBMRegressor"])

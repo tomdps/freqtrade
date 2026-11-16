@@ -23,16 +23,11 @@ def rpl_config(default_conf):
     return default_conf
 
 
-def test_gen_pairlist_with_local_file(mocker, rpl_config):
-    mock_file = MagicMock()
-    mock_file.read.return_value = '{"pairs": ["TKN/USDT","ETH/USDT","NANO/USDT"]}'
-    mocker.patch("freqtrade.plugins.pairlist.RemotePairList.open", return_value=mock_file)
-
-    mock_file_path = mocker.patch("freqtrade.plugins.pairlist.RemotePairList.Path")
-    mock_file_path.exists.return_value = True
-
-    jsonparse = json.loads(mock_file.read.return_value)
-    mocker.patch("freqtrade.plugins.pairlist.RemotePairList.rapidjson.load", return_value=jsonparse)
+def test_gen_pairlist_with_local_file(mocker, rpl_config, tmp_path):
+    pairlist_file = tmp_path / "pairs.json"
+    saved_pairlist = tmp_path / "filtered.json"
+    pairlist_file.write_text(json.dumps({"pairs": ["TKN/USDT", "ETH/USDT", "NANO/USDT"]}))
+    rpl_config["user_data_dir"] = tmp_path
 
     rpl_config["pairlists"] = [
         {
@@ -40,7 +35,8 @@ def test_gen_pairlist_with_local_file(mocker, rpl_config):
             "number_assets": 2,
             "refresh_period": 1800,
             "keep_pairlist_on_failure": True,
-            "pairlist_url": "file:///pairlist.json",
+            "pairlist_url": f"file:///{pairlist_file}",
+            "save_to_file": str(saved_pairlist),
             "bearer_token": "",
             "read_timeout": 60,
         }
@@ -56,6 +52,7 @@ def test_gen_pairlist_with_local_file(mocker, rpl_config):
     result = remote_pairlist.gen_pairlist([])
 
     assert result == ["TKN/USDT", "ETH/USDT"]
+    assert json.loads(saved_pairlist.read_text()) == {"pairs": result}
 
 
 def test_fetch_pairlist_mock_response_html(mocker, rpl_config):
